@@ -50,6 +50,7 @@ export interface FrontmatterValidationResult {
 export interface PathFilterConfig {
   ignoredPatterns: string[];
   allowedExtensions: string[];
+  sidecarPatterns: string[];
 }
 
 // Search types

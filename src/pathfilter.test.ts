@@ -229,6 +229,62 @@ describe("PathFilter", () => {
   });
 
   // ============================================================================
+  // SIDECAR FILE SUPPORT
+  // ============================================================================
+
+  describe("isSidecarAllowed", () => {
+    test("allows .comments.json sidecar when pattern is registered", () => {
+      const filter = new PathFilter({ sidecarPatterns: [".comments.json"] });
+      expect(filter.isSidecarAllowed("notes/note.md.comments.json", ".comments.json")).toBe(true);
+    });
+
+    test("allows sidecar in nested directories", () => {
+      const filter = new PathFilter({ sidecarPatterns: [".comments.json"] });
+      expect(filter.isSidecarAllowed("folder/sub/deep/note.md.comments.json", ".comments.json")).toBe(true);
+    });
+
+    test("blocks sidecar in .obsidian directory", () => {
+      const filter = new PathFilter({ sidecarPatterns: [".comments.json"] });
+      expect(filter.isSidecarAllowed(".obsidian/note.md.comments.json", ".comments.json")).toBe(false);
+    });
+
+    test("blocks sidecar in .git directory", () => {
+      const filter = new PathFilter({ sidecarPatterns: [".comments.json"] });
+      expect(filter.isSidecarAllowed(".git/note.md.comments.json", ".comments.json")).toBe(false);
+    });
+
+    test("blocks sidecar when pattern is not registered", () => {
+      const filter = new PathFilter({ sidecarPatterns: [] });
+      expect(filter.isSidecarAllowed("note.md.comments.json", ".comments.json")).toBe(false);
+    });
+
+    test("blocks files that don't match the sidecar pattern", () => {
+      const filter = new PathFilter({ sidecarPatterns: [".comments.json"] });
+      expect(filter.isSidecarAllowed("note.md.other.json", ".comments.json")).toBe(false);
+      expect(filter.isSidecarAllowed("data.json", ".comments.json")).toBe(false);
+    });
+
+    test("blocks path traversal attempts on sidecar paths", () => {
+      const filter = new PathFilter({
+        sidecarPatterns: [".comments.json"],
+        ignoredPatterns: ["../**"]
+      });
+      expect(filter.isSidecarAllowed("../secret.md.comments.json", ".comments.json")).toBe(false);
+    });
+
+    test("isAllowed still blocks .comments.json files", () => {
+      const filter = new PathFilter({ sidecarPatterns: [".comments.json"] });
+      expect(filter.isAllowed("note.md.comments.json")).toBe(false);
+      expect(filter.isAllowed("folder/note.md.comments.json")).toBe(false);
+    });
+
+    test("handles Windows path separators", () => {
+      const filter = new PathFilter({ sidecarPatterns: [".comments.json"] });
+      expect(filter.isSidecarAllowed("folder\\note.md.comments.json", ".comments.json")).toBe(true);
+    });
+  });
+
+  // ============================================================================
   // EDGE CASES
   // ============================================================================
 

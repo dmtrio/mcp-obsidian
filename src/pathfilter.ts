@@ -3,6 +3,7 @@ import type { PathFilterConfig } from "./types.js";
 export class PathFilter {
   private ignoredPatterns: string[];
   private allowedExtensions: string[];
+  private sidecarPatterns: string[];
 
   constructor(config?: Partial<PathFilterConfig>) {
     this.ignoredPatterns = [
@@ -19,6 +20,10 @@ export class PathFilter {
       '.markdown',
       '.txt',
       ...config?.allowedExtensions || []
+    ];
+
+    this.sidecarPatterns = [
+      ...config?.sidecarPatterns || []
     ];
   }
 
@@ -88,6 +93,25 @@ export class PathFilter {
     // Extension should be 1-10 characters and contain only alphanumeric characters
     // This allows .md, .txt, .markdown but not ". Project" (space after dot)
     return extension.length >= 1 && extension.length <= 10 && /^[a-zA-Z0-9]+$/.test(extension);
+  }
+
+  isSidecarAllowed(filePath: string, pattern: string): boolean {
+    const normalizedPath = filePath.replace(/\\/g, '/');
+
+    // Check against ignored directories (reuse existing security logic)
+    for (const ignored of this.ignoredPatterns) {
+      if (this.simpleGlobMatch(ignored, normalizedPath)) {
+        return false;
+      }
+    }
+
+    // Check the pattern is registered as a known sidecar pattern
+    if (!this.sidecarPatterns.includes(pattern)) {
+      return false;
+    }
+
+    // Check file ends with the sidecar pattern suffix
+    return normalizedPath.endsWith(pattern);
   }
 
   filterPaths(paths: string[]): string[] {
