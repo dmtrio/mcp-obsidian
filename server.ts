@@ -10,6 +10,7 @@ import { FileSystemService } from "./src/filesystem.js";
 import { FrontmatterHandler } from "./src/frontmatter.js";
 import { PathFilter } from "./src/pathfilter.js";
 import { SearchService } from "./src/search.js";
+import { CommentService } from "./src/comments.js";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -36,18 +37,19 @@ if (arg === "--help" || arg === "-h") {
 Universal AI bridge for Obsidian vaults - connect any MCP-compatible assistant
 
 Usage:
-  npx @mauricio.wolff/mcp-obsidian <vault-path>
+  npx @mauricio.wolff/mcp-obsidian <vault-path> [options]
 
 Arguments:
   <vault-path>    Path to your Obsidian vault directory
 
 Options:
-  --version, -v   Show version number
-  --help, -h      Show this help message
+  --author <name>  Author name for comments (default: "mcp-obsidian")
+  --version, -v    Show version number
+  --help, -h       Show this help message
 
 Examples:
   npx @mauricio.wolff/mcp-obsidian ~/Documents/MyVault
-  npx @mauricio.wolff/mcp-obsidian /path/to/obsidian/vault
+  npx @mauricio.wolff/mcp-obsidian /path/to/vault --author claude
 `);
   process.exit(0);
 }
@@ -59,11 +61,18 @@ if (!vaultPath) {
   process.exit(1);
 }
 
+// Parse --author flag
+const authorIndex = process.argv.indexOf('--author');
+const author = authorIndex !== -1 && process.argv[authorIndex + 1]
+  ? process.argv[authorIndex + 1]!
+  : 'mcp-obsidian';
+
 // Initialize services
-const pathFilter = new PathFilter();
+const pathFilter = new PathFilter({ sidecarPatterns: ['.comments.json'] });
 const frontmatterHandler = new FrontmatterHandler();
 const fileSystem = new FileSystemService(vaultPath, pathFilter, frontmatterHandler);
 const searchService = new SearchService(vaultPath, pathFilter);
+const commentService = new CommentService(vaultPath, pathFilter, author, VERSION);
 
 const server = new Server({
   name: "mcp-obsidian",
@@ -385,6 +394,139 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           }
         }
+      },
+      {
+        name: "read_comments",
+        description: "Read comments/annotations on a note from the obsidian-annotated plugin. Returns all comment threads with replies, filtered optionally by status or author. Returns empty result (not error) if note has no comments.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path to the note relative to vault root"
+            },
+            status: {
+              type: "string",
+              enum: ["open", "resolved"],
+              description: "Filter comments by status"
+            },
+            author: {
+              type: "string",
+              description: "Filter comments by author"
+            },
+            prettyPrint: {
+              type: "boolean",
+              description: "Format JSON response with indentation (default: false)",
+              default: false
+            }
+          },
+          required: ["path"]
+        }
+      },
+      {
+        name: "add_comment",
+        description: "Add a new comment/annotation to a note. The comment is stored in a sidecar .comments.json file compatible with the obsidian-annotated plugin. The server captures a content snippet from the target line for position tracking. Author is set from server configuration.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path to the note relative to vault root"
+            },
+            content: {
+              type: "string",
+              description: "Comment text"
+            },
+            startLine: {
+              type: "number",
+              description: "1-indexed start line in the note"
+            },
+            endLine: {
+              type: "number",
+              description: "1-indexed end line (same as startLine for single-line comment)"
+            },
+            startChar: {
+              type: "number",
+              description: "Character offset within start line (default: 0)",
+              default: 0
+            },
+            endChar: {
+              type: "number",
+              description: "Character offset within end line (default: 0)",
+              default: 0
+            }
+          },
+          required: ["path", "content", "startLine", "endLine"]
+        }
+      },
+      {
+        name: "reply_to_comment",
+        description: "Reply to an existing comment thread. If the comment is resolved, replying will reopen it. Author is set from server configuration.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path to the note relative to vault root"
+            },
+            commentId: {
+              type: "string",
+              description: "ID of the comment to reply to"
+            },
+            content: {
+              type: "string",
+              description: "Reply text"
+            }
+          },
+          required: ["path", "commentId", "content"]
+        }
+      },
+      {
+        name: "resolve_comment",
+        description: "Resolve or reopen a comment. Resolving marks a comment thread as done. Idempotent — resolving an already-resolved comment succeeds without error.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path to the note relative to vault root"
+            },
+            commentId: {
+              type: "string",
+              description: "ID of the comment to resolve"
+            },
+            status: {
+              type: "string",
+              enum: ["resolved", "open"],
+              description: "Target status (default: 'resolved')",
+              default: "resolved"
+            }
+          },
+          required: ["path", "commentId"]
+        }
+      },
+      {
+        name: "list_commented_notes",
+        description: "Discover which notes in the vault have comments. Returns notes sorted by open comment count (most actionable first). Useful for finding work — 'what notes have open comments I should look at?'",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Directory scope (default: vault root)"
+            },
+            status: {
+              type: "string",
+              enum: ["open", "resolved"],
+              description: "Only include notes that have comments with this status"
+            },
+            prettyPrint: {
+              type: "boolean",
+              description: "Format JSON response with indentation (default: false)",
+              default: false
+            }
+          }
+        }
       }
     ]
   };
@@ -636,6 +778,90 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 size: stats.totalSize,
                 recent: stats.recentlyModified
               }, null, indent)
+            }
+          ]
+        };
+      }
+
+      case "read_comments": {
+        const result = await commentService.readComments({
+          path: trimmedArgs.path,
+          status: trimmedArgs.status,
+          author: trimmedArgs.author
+        });
+        const indent = trimmedArgs.prettyPrint ? 2 : undefined;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, indent)
+            }
+          ]
+        };
+      }
+
+      case "add_comment": {
+        const result = await commentService.addComment({
+          path: trimmedArgs.path,
+          content: trimmedArgs.content,
+          startLine: trimmedArgs.startLine,
+          endLine: trimmedArgs.endLine,
+          startChar: trimmedArgs.startChar,
+          endChar: trimmedArgs.endChar
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2)
+            }
+          ]
+        };
+      }
+
+      case "reply_to_comment": {
+        const result = await commentService.replyToComment({
+          path: trimmedArgs.path,
+          commentId: trimmedArgs.commentId,
+          content: trimmedArgs.content
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2)
+            }
+          ]
+        };
+      }
+
+      case "resolve_comment": {
+        const result = await commentService.resolveComment({
+          path: trimmedArgs.path,
+          commentId: trimmedArgs.commentId,
+          status: trimmedArgs.status
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2)
+            }
+          ]
+        };
+      }
+
+      case "list_commented_notes": {
+        const result = await commentService.listCommentedNotes({
+          path: trimmedArgs.path,
+          status: trimmedArgs.status
+        });
+        const indent = trimmedArgs.prettyPrint ? 2 : undefined;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, indent)
             }
           ]
         };
