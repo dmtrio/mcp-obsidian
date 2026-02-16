@@ -3,7 +3,8 @@ import { FileSystemService } from "./filesystem.js";
 import { FrontmatterHandler } from "./frontmatter.js";
 import { PathFilter } from "./pathfilter.js";
 import { SearchService } from "./search.js";
-import { writeFile, mkdir, mkdtemp, rm } from "fs/promises";
+import { CommentService } from "./comments.js";
+import { writeFile, readFile, mkdir, mkdtemp, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 let testVaultPath;
@@ -11,13 +12,15 @@ let pathFilter;
 let frontmatterHandler;
 let fileSystem;
 let searchService;
+let commentService;
 beforeEach(async () => {
     testVaultPath = await mkdtemp(join(tmpdir(), "mcp-obsidian-integration-"));
     // Initialize services (same as server.ts)
-    pathFilter = new PathFilter();
+    pathFilter = new PathFilter({ sidecarPatterns: [".comments.json"] });
     frontmatterHandler = new FrontmatterHandler();
     fileSystem = new FileSystemService(testVaultPath, pathFilter, frontmatterHandler);
     searchService = new SearchService(testVaultPath, pathFilter);
+    commentService = new CommentService(testVaultPath, pathFilter, "claude", "1.0.0");
 });
 afterEach(async () => {
     try {
@@ -36,7 +39,7 @@ describe("Integration: Service Layer Workflows", () => {
         await fileSystem.writeNote({
             path: "test-note.md",
             content: "# Test Note\n\nThis is a test.",
-            frontmatter: { tags: ["test"], status: "draft" }
+            frontmatter: { tags: ["test"], status: "draft" },
         });
         // 2. Read the note back
         const note = await fileSystem.readNote("test-note.md");
@@ -46,22 +49,28 @@ describe("Integration: Service Layer Workflows", () => {
         // 3. Delete the note
         const deleteResult = await fileSystem.deleteNote({
             path: "test-note.md",
-            confirmPath: "test-note.md"
+            confirmPath: "test-note.md",
         });
         expect(deleteResult.success).toBe(true);
     });
     test("search notes with special characters in filenames", async () => {
         // Create notes with special characters in paths
         const testCases = [
-            { path: "folder (archive)/note [old].md", content: "# Old Note\n\nArchived keyword." },
+            {
+                path: "folder (archive)/note [old].md",
+                content: "# Old Note\n\nArchived keyword.",
+            },
             { path: "C++/notes.md", content: "# C++ Notes\n\nProgramming keyword." },
-            { path: "backup.2024/important.md", content: "# Important\n\nBackup keyword." },
-            { path: "price$100.md", content: "# Pricing\n\nCost keyword." }
+            {
+                path: "backup.2024/important.md",
+                content: "# Important\n\nBackup keyword.",
+            },
+            { path: "price$100.md", content: "# Pricing\n\nCost keyword." },
         ];
         // Write all test notes
         for (const { path, content } of testCases) {
-            if (path.includes('/')) {
-                const dirName = path.split('/')[0];
+            if (path.includes("/")) {
+                const dirName = path.split("/")[0];
                 if (dirName) {
                     await mkdir(join(testVaultPath, dirName), { recursive: true });
                 }
@@ -71,7 +80,7 @@ describe("Integration: Service Layer Workflows", () => {
         // Search for keyword
         const results = await searchService.search({
             query: "keyword",
-            limit: 10
+            limit: 10,
         });
         expect(results.length).toBe(4);
         // Verify paths with special characters are returned correctly
@@ -88,7 +97,7 @@ Math: 2 + 2 = 4
 Pattern: backup.2024/**/*.md`;
         await fileSystem.writeNote({
             path: "special-chars.md",
-            content
+            content,
         });
         // Read back and verify exact content
         const note = await fileSystem.readNote("special-chars.md");
@@ -103,7 +112,7 @@ Pattern: backup.2024/**/*.md`;
         await mkdir(join(testVaultPath, "📁"), { recursive: true });
         const testCases = [
             { path: "日本語/ノート.md", content: "# 日本語のメモ\n\nこんにちは世界" },
-            { path: "📁/🎉.md", content: "# Celebration\n\n🎊 Party time! 🎈" }
+            { path: "📁/🎉.md", content: "# Celebration\n\n🎊 Party time! 🎈" },
         ];
         // Write notes
         for (const { path, content } of testCases) {
@@ -119,20 +128,17 @@ Pattern: backup.2024/**/*.md`;
         const maliciousPaths = [
             "../etc/passwd",
             "../../secret.txt",
-            "folder/../../../outside.md"
+            "folder/../../../outside.md",
         ];
         for (const path of maliciousPaths) {
-            await expect(fileSystem.readNote(path))
-                .rejects.toThrow(/Path traversal not allowed|Access denied/);
+            await expect(fileSystem.readNote(path)).rejects.toThrow(/Path traversal not allowed|Access denied/);
         }
     });
     test("security: blocked directories not accessible", async () => {
         // Try to access .obsidian
-        await expect(fileSystem.readNote(".obsidian/app.json"))
-            .rejects.toThrow(/Access denied/);
+        await expect(fileSystem.readNote(".obsidian/app.json")).rejects.toThrow(/Access denied/);
         // Try to access .git
-        await expect(fileSystem.readNote(".git/config"))
-            .rejects.toThrow(/Access denied/);
+        await expect(fileSystem.readNote(".git/config")).rejects.toThrow(/Access denied/);
     });
     test("multi-step workflow: search, read multiple, update frontmatter", async () => {
         // Create several notes
@@ -140,21 +146,21 @@ Pattern: backup.2024/**/*.md`;
             await fileSystem.writeNote({
                 path: `note-${i}.md`,
                 content: `# Note ${i}\n\nThis contains searchterm.`,
-                frontmatter: { id: i, processed: false }
+                frontmatter: { id: i, processed: false },
             });
         }
         // Search for notes
         const searchResults = await searchService.search({
             query: "searchterm",
-            limit: 10
+            limit: 10,
         });
         expect(searchResults.length).toBe(3);
         // Read multiple notes
-        const paths = searchResults.map(r => r.p);
+        const paths = searchResults.map((r) => r.p);
         const readResult = await fileSystem.readMultipleNotes({
             paths,
             includeContent: true,
-            includeFrontmatter: true
+            includeFrontmatter: true,
         });
         expect(readResult.successful.length).toBe(3);
         // Update frontmatter on all notes
@@ -162,7 +168,7 @@ Pattern: backup.2024/**/*.md`;
             await fileSystem.updateFrontmatter({
                 path,
                 frontmatter: { processed: true },
-                merge: true
+                merge: true,
             });
         }
         // Verify updates
@@ -170,6 +176,220 @@ Pattern: backup.2024/**/*.md`;
             const note = await fileSystem.readNote(path);
             expect(note.frontmatter?.processed).toBe(true);
         }
+    });
+});
+// ============================================================================
+// COMMENT COLLABORATION WORKFLOW
+// ============================================================================
+describe("Integration: Comment Collaboration Workflow", () => {
+    test("full human-AI collaboration loop", async () => {
+        // 1. Human creates a note
+        await fileSystem.writeNote({
+            path: "research/draft.md",
+            content: "# Research Draft\n\nThe sky is green.\n\nConclusion here.\n",
+            frontmatter: { status: "review" },
+        });
+        // 2. Human leaves a comment (simulated as plugin-created sidecar)
+        const humanSidecar = {
+            version: 1,
+            createdBy: "obsidian-annotated@0.1.0",
+            note_path: "research/draft.md",
+            created_at: "2026-02-16T10:00:00.000Z",
+            updated_at: "2026-02-16T10:00:00.000Z",
+            comments: [
+                {
+                    id: "c_human001",
+                    author: "bob",
+                    created_at: "2026-02-16T10:00:00.000Z",
+                    location: {
+                        type: "range",
+                        start_line: 3,
+                        start_char: 0,
+                        end_line: 3,
+                        end_char: 0,
+                    },
+                    content: "This is wrong, the sky is blue. Please fix.",
+                    status: "open",
+                    replies: [],
+                    last_activity_at: "2026-02-16T10:00:00.000Z",
+                    content_snippet: "The sky is green.",
+                },
+            ],
+            metadata: {
+                total_comments: 1,
+                open_count: 1,
+                resolved_count: 0,
+                authors: ["bob"],
+            },
+        };
+        await writeFile(join(testVaultPath, "research/draft.md.comments.json"), JSON.stringify(humanSidecar, null, 2));
+        // 3. AI discovers notes with comments
+        const listed = await commentService.listCommentedNotes();
+        expect(listed.notes).toHaveLength(1);
+        expect(listed.notes[0].path).toBe("research/draft.md");
+        expect(listed.notes[0].open).toBe(1);
+        // 4. AI reads the comments
+        const comments = await commentService.readComments({
+            path: "research/draft.md",
+            status: "open",
+        });
+        expect(comments.comments).toHaveLength(1);
+        expect(comments.comments[0].content).toContain("sky is blue");
+        // 5. AI fixes the note
+        const patchResult = await fileSystem.patchNote({
+            path: "research/draft.md",
+            oldString: "The sky is green.",
+            newString: "The sky is blue.",
+        });
+        expect(patchResult.success).toBe(true);
+        // 6. AI replies to the comment
+        const replyResult = await commentService.replyToComment({
+            path: "research/draft.md",
+            commentId: "c_human001",
+            content: "Fixed — changed 'green' to 'blue' on line 3.",
+        });
+        expect(replyResult.success).toBe(true);
+        expect(replyResult.reopened).toBe(false);
+        // 7. AI resolves the comment
+        const resolveResult = await commentService.resolveComment({
+            path: "research/draft.md",
+            commentId: "c_human001",
+        });
+        expect(resolveResult.success).toBe(true);
+        expect(resolveResult.status).toBe("resolved");
+        // 8. Verify final state
+        const finalComments = await commentService.readComments({
+            path: "research/draft.md",
+        });
+        expect(finalComments.comments[0].status).toBe("resolved");
+        expect(finalComments.comments[0].replies).toHaveLength(1);
+        expect(finalComments.comments[0].replies[0].author).toBe("claude");
+        expect(finalComments.metadata.open_count).toBe(0);
+        expect(finalComments.metadata.resolved_count).toBe(1);
+        expect(finalComments.metadata.authors).toEqual(["bob", "claude"]);
+        const fixedNote = await fileSystem.readNote("research/draft.md");
+        expect(fixedNote.content).toContain("The sky is blue.");
+    });
+    test("AI leaves new comment and human reopens via reply", async () => {
+        // 1. Create note
+        await fileSystem.writeNote({
+            path: "report.md",
+            content: "# Report\n\nNeeds citation.\n\nEnd.\n",
+        });
+        // 2. AI adds a comment
+        const addResult = await commentService.addComment({
+            path: "report.md",
+            content: "This paragraph needs a source citation.",
+            startLine: 3,
+            endLine: 3,
+        });
+        expect(addResult.success).toBe(true);
+        // 3. Verify sidecar is valid JSON the plugin can read
+        const sidecarRaw = await readFile(join(testVaultPath, "report.md.comments.json"), "utf-8");
+        const sidecar = JSON.parse(sidecarRaw);
+        expect(sidecar.version).toBe(1);
+        expect(sidecar.comments[0].content_snippet).toBe("Needs citation.");
+        expect(sidecar.comments[0].location.start_line).toBe(3);
+        // 4. AI resolves its own comment
+        await commentService.resolveComment({
+            path: "report.md",
+            commentId: addResult.commentId,
+        });
+        // 5. Human replies (simulated as another service instance) — should reopen
+        const humanService = new CommentService(testVaultPath, pathFilter, "bob", "1.0.0");
+        const replyResult = await humanService.replyToComment({
+            path: "report.md",
+            commentId: addResult.commentId,
+            content: "Not done yet, still needs the citation.",
+        });
+        expect(replyResult.reopened).toBe(true);
+        // 6. Verify comment is open again
+        const final = await commentService.readComments({ path: "report.md" });
+        expect(final.comments[0].status).toBe("open");
+        expect(final.comments[0].replies).toHaveLength(1);
+    });
+    test("multiple notes with comments across directories", async () => {
+        // Create notes in different dirs
+        await mkdir(join(testVaultPath, "project-a"), { recursive: true });
+        await mkdir(join(testVaultPath, "project-b"), { recursive: true });
+        await fileSystem.writeNote({
+            path: "project-a/spec.md",
+            content: "# Spec A\nLine 2\nLine 3\n",
+        });
+        await fileSystem.writeNote({
+            path: "project-b/spec.md",
+            content: "# Spec B\nLine 2\n",
+        });
+        await fileSystem.writeNote({
+            path: "no-comments.md",
+            content: "# Clean\n",
+        });
+        // Add comments to both project notes
+        await commentService.addComment({
+            path: "project-a/spec.md",
+            content: "Review A1",
+            startLine: 1,
+            endLine: 1,
+        });
+        await commentService.addComment({
+            path: "project-a/spec.md",
+            content: "Review A2",
+            startLine: 2,
+            endLine: 2,
+        });
+        await commentService.addComment({
+            path: "project-b/spec.md",
+            content: "Review B1",
+            startLine: 1,
+            endLine: 1,
+        });
+        // List all — should find 2 notes, sorted by open count
+        const allNotes = await commentService.listCommentedNotes();
+        expect(allNotes.notes).toHaveLength(2);
+        expect(allNotes.notes[0].path).toBe("project-a/spec.md"); // 2 open
+        expect(allNotes.notes[1].path).toBe("project-b/spec.md"); // 1 open
+        expect(allNotes.summary.totalOpen).toBe(3);
+        // Scope to project-a
+        const scopedNotes = await commentService.listCommentedNotes({
+            path: "project-a",
+        });
+        expect(scopedNotes.notes).toHaveLength(1);
+        expect(scopedNotes.notes[0].path).toBe("project-a/spec.md");
+    });
+    test("comment sidecar survives note edit", async () => {
+        await fileSystem.writeNote({
+            path: "editable.md",
+            content: "# Title\n\nOriginal line 3.\n\nLine 5.\n",
+        });
+        // Add comment on line 3
+        await commentService.addComment({
+            path: "editable.md",
+            content: "Commenting on original content",
+            startLine: 3,
+            endLine: 3,
+        });
+        // Edit the note (this doesn't touch the sidecar)
+        await fileSystem.patchNote({
+            path: "editable.md",
+            oldString: "Original line 3.",
+            newString: "Edited line 3.",
+        });
+        // Comments are still there and readable
+        const comments = await commentService.readComments({ path: "editable.md" });
+        expect(comments.comments).toHaveLength(1);
+        expect(comments.comments[0].content_snippet).toBe("Original line 3.");
+        // Plugin's snippet matcher would handle relocation — MCP just preserves the data
+    });
+    test("existing note tools cannot access .comments.json files", async () => {
+        await fileSystem.writeNote({ path: "secret.md", content: "# Secret\n" });
+        await commentService.addComment({
+            path: "secret.md",
+            content: "Comment",
+            startLine: 1,
+            endLine: 1,
+        });
+        // read_note should reject .comments.json
+        await expect(fileSystem.readNote("secret.md.comments.json")).rejects.toThrow(/Access denied/);
     });
 });
 // ============================================================================
@@ -186,7 +406,7 @@ describe("Performance: Post-PR#12 Overhead", () => {
             "backup.2024/data.md",
             ".obsidian/app.json",
             ".git/config",
-            "node_modules/package/index.js"
+            "node_modules/package/index.js",
         ];
         const start = performance.now();
         // Run 1000 iterations
@@ -219,7 +439,7 @@ describe("Performance: Post-PR#12 Overhead", () => {
             batches.push(fileSystem.readMultipleNotes({
                 paths: batchPaths,
                 includeContent: true,
-                includeFrontmatter: true
+                includeFrontmatter: true,
             }));
         }
         await Promise.all(batches);
