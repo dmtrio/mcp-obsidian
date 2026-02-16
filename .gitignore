@@ -9,6 +9,7 @@ coverage/
 
 # Production
 build/
+dist
 
 # Runtime data
 pids

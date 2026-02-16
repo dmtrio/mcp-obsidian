@@ -145,3 +145,135 @@ export interface VaultStats {
     modified: number;  // timestamp
   }>;
 }
+
+// Comment types (obsidian-annotated plugin integration)
+
+export const OBSIDIAN_ANNOTATED_SCHEMA_VERSION = 1;
+
+export type CommentStatus = 'open' | 'resolved';
+
+export interface CommentLocation {
+  type: 'range';
+  start_line: number;
+  start_char: number;
+  end_line: number;
+  end_char: number;
+}
+
+export interface CommentReply {
+  id: string;
+  author: string;
+  created_at: string;
+  content: string;
+  status: CommentStatus;
+}
+
+export interface Comment {
+  id: string;
+  author: string;
+  created_at: string;
+  location: CommentLocation;
+  content: string;
+  status: CommentStatus;
+  replies: CommentReply[];
+  last_activity_at: string;
+  content_snippet: string;
+}
+
+export interface CommentMetadata {
+  total_comments: number;
+  open_count: number;
+  resolved_count: number;
+  authors: string[];
+}
+
+export interface CommentFile {
+  version: number;
+  createdBy: string;
+  note_path: string;
+  created_at: string;
+  updated_at: string;
+  comments: Comment[];
+  metadata: CommentMetadata;
+}
+
+// Comment tool parameter types
+
+export interface ReadCommentsParams {
+  path: string;
+  status?: CommentStatus;
+  author?: string;
+  prettyPrint?: boolean;
+}
+
+export interface AddCommentParams {
+  path: string;
+  content: string;
+  startLine: number;
+  endLine: number;
+  startChar?: number;
+  endChar?: number;
+}
+
+export interface ReplyToCommentParams {
+  path: string;
+  commentId: string;
+  content: string;
+}
+
+export interface ResolveCommentParams {
+  path: string;
+  commentId: string;
+  status?: CommentStatus;
+}
+
+export interface ListCommentedNotesParams {
+  path?: string;
+  status?: CommentStatus;
+  prettyPrint?: boolean;
+}
+
+// Comment tool result types
+
+export interface ReadCommentsResult {
+  note_path: string;
+  comments: Comment[];
+  metadata: CommentMetadata;
+}
+
+export interface AddCommentResult {
+  success: boolean;
+  commentId: string;
+  path: string;
+}
+
+export interface ReplyResult {
+  success: boolean;
+  replyId: string;
+  commentId: string;
+  reopened: boolean;
+}
+
+export interface ResolveResult {
+  success: boolean;
+  commentId: string;
+  status: CommentStatus;
+}
+
+export interface CommentedNoteSummary {
+  path: string;
+  total: number;
+  open: number;
+  resolved: number;
+  authors: string[];
+  lastActivity: string;
+}
+
+export interface ListCommentedNotesResult {
+  notes: CommentedNoteSummary[];
+  summary: {
+    notesWithComments: number;
+    totalOpen: number;
+    totalResolved: number;
+  };
+}
