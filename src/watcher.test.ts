@@ -45,8 +45,8 @@ describe('FileWatcherService', () => {
   // ============================================================================
 
   describe('cursor management', () => {
-    it('creates a cursor with correct structure', async () => {
-      const cursor = await watcher.createCursor('project', 'Claude');
+    it('creates a cursor with correct structure', () => {
+      const cursor = watcher.createCursor('project', 'Claude');
 
       expect(cursor.id).toMatch(/^w_/);
       expect(cursor.folder).toBe('project');
@@ -57,8 +57,8 @@ describe('FileWatcherService', () => {
       expect(cursor.seenComments.size).toBe(0);
     });
 
-    it('decodes an existing cursor', async () => {
-      const cursor = await watcher.createCursor('project', 'Claude');
+    it('decodes an existing cursor', () => {
+      const cursor = watcher.createCursor('project', 'Claude');
       const decoded = watcher.decodeCursor(cursor.id);
 
       expect(decoded).not.toBeNull();
@@ -71,8 +71,8 @@ describe('FileWatcherService', () => {
       expect(decoded).toBeNull();
     });
 
-    it('updates cursor seen comments', async () => {
-      const cursor = await watcher.createCursor('project', 'Claude');
+    it('updates cursor seen comments', () => {
+      const cursor = watcher.createCursor('project', 'Claude');
 
       const seenComments = new Map([
         ['c_abc123', { replyCount: 2, status: 'open' as const, lastActivityAt: new Date().toISOString() }]
@@ -84,9 +84,9 @@ describe('FileWatcherService', () => {
       expect(decoded!.seenComments.get('c_abc123')!.replyCount).toBe(2);
     });
 
-    it('generates unique cursor IDs', async () => {
-      const cursor1 = await watcher.createCursor('project', 'Claude');
-      const cursor2 = await watcher.createCursor('project', 'Claude');
+    it('generates unique cursor IDs', () => {
+      const cursor1 = watcher.createCursor('project', 'Claude');
+      const cursor2 = watcher.createCursor('project', 'Claude');
       expect(cursor1.id).not.toBe(cursor2.id);
     });
   });
@@ -101,7 +101,7 @@ describe('FileWatcherService', () => {
       const watchPromise = watcher.watch('project', undefined, 'Claude');
 
       // Write a sidecar file after a brief pause
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(
         join(vaultPath, 'project', 'note.md.comments.json'),
         JSON.stringify({ version: 1, comments: [] })
@@ -123,7 +123,7 @@ describe('FileWatcherService', () => {
       // Start watch, then modify
       const watchPromise = watcher.watch('project', undefined, 'Claude');
 
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(sidecarPath, JSON.stringify({ version: 1, comments: [{ id: 'c_1' }] }));
 
       const result = await watchPromise;
@@ -143,7 +143,7 @@ describe('FileWatcherService', () => {
       const watchPromise = shortWatcher.watch('project', undefined, 'test');
 
       // Write a non-sidecar file
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(join(vaultPath, 'project', 'note.md'), '# Hello');
 
       // Wait a bit — if the watcher incorrectly triggered on .md, it would have resolved
@@ -156,10 +156,15 @@ describe('FileWatcherService', () => {
       expect(result.changedFiles).toEqual([]);
     });
 
+    it('rejects path traversal attempts', async () => {
+      await expect(watcher.watch('../../etc', undefined, 'Claude'))
+        .rejects.toThrow('Folder must be within vault');
+    });
+
     it('returns cursor for subsequent calls', async () => {
       const watchPromise = watcher.watch('project', undefined, 'Claude');
 
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(
         join(vaultPath, 'project', 'note.md.comments.json'),
         JSON.stringify({ version: 1, comments: [] })
@@ -171,7 +176,7 @@ describe('FileWatcherService', () => {
       // Use cursor for second watch
       const watch2Promise = watcher.watch('project', cursor, 'Claude');
 
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(
         join(vaultPath, 'project', 'note.md.comments.json'),
         JSON.stringify({ version: 1, comments: [{ id: 'c_new' }] })
@@ -185,7 +190,7 @@ describe('FileWatcherService', () => {
     it('treats invalid cursor as first call', async () => {
       const watchPromise = watcher.watch('project', 'w_bogus', 'Claude');
 
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(
         join(vaultPath, 'project', 'note.md.comments.json'),
         JSON.stringify({ version: 1, comments: [] })
@@ -206,7 +211,7 @@ describe('FileWatcherService', () => {
   describe('session expiry', () => {
     it('returns session_expired when session timeout exceeded', async () => {
       // Create a cursor with an old session start
-      const cursor = await watcher.createCursor('project', 'Claude');
+      const cursor = watcher.createCursor('project', 'Claude');
       cursor.sessionStart = new Date(Date.now() - 400 * 1000); // 400s ago, timeout is 300s
 
       const result = await watcher.watch('project', cursor.id, 'Claude');
@@ -214,11 +219,11 @@ describe('FileWatcherService', () => {
       expect(result.changedFiles).toEqual([]);
     });
 
-    it('cleanupExpiredSessions removes old cursors', async () => {
-      const cursor1 = await watcher.createCursor('project', 'Claude');
+    it('cleanupExpiredSessions removes old cursors', () => {
+      const cursor1 = watcher.createCursor('project', 'Claude');
       cursor1.sessionStart = new Date(Date.now() - 4000 * 1000); // very old
 
-      const cursor2 = await watcher.createCursor('project', 'Claude');
+      const cursor2 = watcher.createCursor('project', 'Claude');
       // cursor2 is fresh
 
       const cleaned = watcher.cleanupExpiredSessions(3600);
@@ -272,15 +277,15 @@ describe('FileWatcherService', () => {
 
   describe('cancel', () => {
     it('cancels an active watch', async () => {
-      const watchPromise = watcher.watch('project', undefined, 'Claude');
+      // Create cursor first to get the ID, then watch with it
+      const cursor = watcher.createCursor('project', 'Claude');
+      const watchPromise = watcher.watch('project', cursor.id, 'Claude');
 
       // Small delay to let watch set up
       await new Promise(resolve => setTimeout(resolve, 10));
       expect(watcher.getActiveWatchCount()).toBe(1);
 
-      // Get the cursor ID from the internal state
-      const cursors = [...(watcher as any).cursors.keys()];
-      watcher.cancel(cursors[0]);
+      watcher.cancel(cursor.id);
 
       const result = await watchPromise;
       expect(result.timedOut).toBe(false);

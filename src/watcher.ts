@@ -1,20 +1,23 @@
 import { watch, type FSWatcher } from 'node:fs';
-import { join, resolve } from 'path';
+import { resolve } from 'path';
 import { WatchConfigService } from './config.js';
 import type { CursorState, SeenCommentState } from './types.js';
 
 const SIDECAR_SUFFIX = '.comments.json';
+const CLEANUP_INTERVAL_MS = 60_000;
 
 export interface RawWatchResult {
   changedFiles: string[];
   timedOut: boolean;
   sessionExpired: boolean;
+  watchError: boolean;
   cursor: string;
 }
 
 interface ActiveWatch {
   watcher: FSWatcher | null;
   timer: ReturnType<typeof setTimeout> | null;
+  debounceTimer: ReturnType<typeof setTimeout> | null;
   resolve: ((result: RawWatchResult) => void) | null;
   cursorId: string;
 }
@@ -24,12 +27,31 @@ export class FileWatcherService {
   private cursors: Map<string, CursorState> = new Map();
   private activeWatches: Map<string, ActiveWatch> = new Map();
   private cursorCounter = 0;
+  private cleanupInterval: ReturnType<typeof setInterval>;
 
   constructor(
     vaultPath: string,
     private configService: WatchConfigService
   ) {
     this.vaultPath = resolve(vaultPath);
+
+    // Periodic cleanup of expired sessions to prevent memory leaks
+    this.cleanupInterval = setInterval(() => {
+      const config = this.configService.getConfig();
+      this.cleanupExpiredSessions(config.sessionTimeout);
+    }, CLEANUP_INTERVAL_MS);
+  }
+
+  /**
+   * Validate that folder is within the vault boundary.
+   * Prevents path traversal (e.g., '../../etc').
+   */
+  private validateFolder(folder: string): string {
+    const fullFolder = resolve(this.vaultPath, folder);
+    if (!fullFolder.startsWith(this.vaultPath + '/') && fullFolder !== this.vaultPath) {
+      throw new Error(`Folder must be within vault: ${folder}`);
+    }
+    return fullFolder;
   }
 
   async watch(
@@ -38,6 +60,9 @@ export class FileWatcherService {
     agentName?: string
   ): Promise<RawWatchResult> {
     const config = this.configService.resolveForAgent(agentName);
+
+    // Validate folder is within vault
+    const fullFolder = this.validateFolder(folder);
 
     // Check max concurrent
     if (this.activeWatches.size >= config.maxConcurrent) {
@@ -50,7 +75,7 @@ export class FileWatcherService {
       const existing = this.decodeCursor(cursorId);
       if (!existing) {
         // Invalid/expired cursor — create fresh
-        cursor = await this.createCursor(folder, agentName || 'unknown');
+        cursor = this.createCursor(folder, agentName || 'unknown');
       } else {
         // Check session expiry
         const sessionAge = (Date.now() - existing.sessionStart.getTime()) / 1000;
@@ -60,19 +85,18 @@ export class FileWatcherService {
             changedFiles: [],
             timedOut: false,
             sessionExpired: true,
+            watchError: false,
             cursor: cursorId,
           };
         }
         cursor = existing;
       }
     } else {
-      cursor = await this.createCursor(folder, agentName || 'unknown');
+      cursor = this.createCursor(folder, agentName || 'unknown');
     }
 
-    const fullFolder = join(this.vaultPath, folder);
-
     return new Promise<RawWatchResult>((resolvePromise) => {
-      let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+      let resolved = false;
       const changedFiles = new Set<string>();
 
       const cleanup = () => {
@@ -84,14 +108,17 @@ export class FileWatcherService {
           clearTimeout(activeWatch.timer);
           activeWatch.timer = null;
         }
-        if (debounceTimer) {
-          clearTimeout(debounceTimer);
-          debounceTimer = null;
+        if (activeWatch.debounceTimer) {
+          clearTimeout(activeWatch.debounceTimer);
+          activeWatch.debounceTimer = null;
         }
+        activeWatch.resolve = null;
         this.activeWatches.delete(cursor.id);
       };
 
       const complete = (result: RawWatchResult) => {
+        if (resolved) return; // Guard against double-resolve
+        resolved = true;
         cleanup();
         cursor.lastChecked = new Date();
         resolvePromise(result);
@@ -100,6 +127,7 @@ export class FileWatcherService {
       const activeWatch: ActiveWatch = {
         watcher: null,
         timer: null,
+        debounceTimer: null,
         resolve: resolvePromise,
         cursorId: cursor.id,
       };
@@ -111,11 +139,15 @@ export class FileWatcherService {
           changedFiles: [],
           timedOut: true,
           sessionExpired: false,
+          watchError: false,
           cursor: cursor.id,
         });
       }, config.pollTimeout * 1000);
 
       // Set up fs.watch
+      // Note: { recursive: true } is supported on macOS (FSEvents) and Windows.
+      // On Linux, it may silently degrade to non-recursive. If cross-platform
+      // recursive watching is needed, consider chokidar.
       try {
         activeWatch.watcher = watch(fullFolder, { recursive: true }, (_eventType, filename) => {
           if (!filename || !filename.endsWith(SIDECAR_SUFFIX)) return;
@@ -123,40 +155,42 @@ export class FileWatcherService {
           changedFiles.add(filename);
 
           // Debounce: wait 100ms after last change before resolving
-          if (debounceTimer) clearTimeout(debounceTimer);
-          debounceTimer = setTimeout(() => {
+          if (activeWatch.debounceTimer) clearTimeout(activeWatch.debounceTimer);
+          activeWatch.debounceTimer = setTimeout(() => {
             complete({
               changedFiles: [...changedFiles],
               timedOut: false,
               sessionExpired: false,
+              watchError: false,
               cursor: cursor.id,
             });
           }, 100);
         });
 
         activeWatch.watcher.on('error', () => {
-          // Watcher error — resolve with empty result (will trigger re-watch or error handling upstream)
           complete({
             changedFiles: [],
-            timedOut: true,
+            timedOut: false,
             sessionExpired: false,
+            watchError: true,
             cursor: cursor.id,
           });
         });
       } catch {
-        // fs.watch failed — fall back to timeout response
+        // fs.watch failed to start
         cleanup();
         resolvePromise({
           changedFiles: [],
-          timedOut: true,
+          timedOut: false,
           sessionExpired: false,
+          watchError: true,
           cursor: cursor.id,
         });
       }
     });
   }
 
-  async createCursor(folder: string, agentName: string): Promise<CursorState> {
+  createCursor(folder: string, agentName: string): CursorState {
     const id = 'w_' + (++this.cursorCounter).toString(36) + '_' + Date.now().toString(36);
     const now = new Date();
 
@@ -188,17 +222,30 @@ export class FileWatcherService {
   cancel(cursorId: string): void {
     const activeWatch = this.activeWatches.get(cursorId);
     if (activeWatch) {
-      if (activeWatch.watcher) activeWatch.watcher.close();
-      if (activeWatch.timer) clearTimeout(activeWatch.timer);
-      if (activeWatch.resolve) {
-        activeWatch.resolve({
+      if (activeWatch.watcher) {
+        activeWatch.watcher.close();
+        activeWatch.watcher = null;
+      }
+      if (activeWatch.timer) {
+        clearTimeout(activeWatch.timer);
+        activeWatch.timer = null;
+      }
+      if (activeWatch.debounceTimer) {
+        clearTimeout(activeWatch.debounceTimer);
+        activeWatch.debounceTimer = null;
+      }
+      const resolveFn = activeWatch.resolve;
+      activeWatch.resolve = null;
+      this.activeWatches.delete(cursorId);
+      if (resolveFn) {
+        resolveFn({
           changedFiles: [],
           timedOut: false,
           sessionExpired: false,
+          watchError: false,
           cursor: cursorId,
         });
       }
-      this.activeWatches.delete(cursorId);
     }
   }
 
@@ -223,7 +270,10 @@ export class FileWatcherService {
   }
 
   destroy(): void {
-    for (const [id] of this.activeWatches) {
+    clearInterval(this.cleanupInterval);
+    // Collect IDs first — cancel() mutates activeWatches
+    const ids = [...this.activeWatches.keys()];
+    for (const id of ids) {
       this.cancel(id);
     }
     this.cursors.clear();
