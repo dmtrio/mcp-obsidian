@@ -278,3 +278,71 @@ export interface ListCommentedNotesResult {
     totalResolved: number;
   };
 }
+
+// Watch types (reactive comment collaboration)
+
+export type WatchStatus = 'changed' | 'timeout' | 'session_expired' | 'error';
+
+export type WatchCommentAction = 'created' | 'reply_added' | 'reopened';
+
+export interface WatchCommentsParams {
+  path: string;
+  cursor?: string;
+  excludeAuthors?: string[];
+}
+
+export interface ActionableComment {
+  id: string;
+  note: string;
+  author: string;
+  content: string;
+  location: CommentLocation;
+  createdAt: string;
+  action: WatchCommentAction;
+  replies: CommentReply[];
+}
+
+export interface WatchResult {
+  status: WatchStatus;
+  cursor: string | null;
+  comments: ActionableComment[];
+  watchedPath: string;
+  error?: string;
+}
+
+// Watch configuration types
+
+export interface AgentWatchConfig {
+  pollTimeout?: number;
+  sessionTimeout?: number;
+}
+
+export interface WatchConfig {
+  pollTimeout: number;
+  sessionTimeout: number;
+  maxConcurrent: number;
+  agents: Record<string, AgentWatchConfig>;
+}
+
+export interface ResolvedWatchConfig {
+  pollTimeout: number;
+  sessionTimeout: number;
+  maxConcurrent: number;
+}
+
+// Cursor state (server-side, not exposed to AI)
+
+export interface SeenCommentState {
+  replyCount: number;
+  status: CommentStatus;
+  lastActivityAt: string;
+}
+
+export interface CursorState {
+  id: string;
+  folder: string;
+  agentName: string;
+  sessionStart: Date;
+  lastChecked: Date;
+  seenComments: Map<string, SeenCommentState>;
+}
