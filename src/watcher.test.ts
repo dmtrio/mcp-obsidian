@@ -5,6 +5,23 @@ import { tmpdir } from 'os';
 import { FileWatcherService } from './watcher.js';
 import { WatchConfigService } from './config.js';
 
+/** Start a watch and wait for chokidar to be ready before returning. */
+async function watchReady(
+  watcher: FileWatcherService,
+  folder: string,
+  cursorId?: string,
+  agentName?: string
+): Promise<{ promise: Promise<ReturnType<FileWatcherService['watch']> extends Promise<infer T> ? T : never>; cursorId: string }> {
+  // Pre-create cursor so we know the ID before watch() resolves
+  const cursor = cursorId
+    ? (watcher.decodeCursor(cursorId) ? cursorId : watcher.createCursor(folder, agentName || 'unknown').id)
+    : watcher.createCursor(folder, agentName || 'unknown').id;
+
+  const promise = watcher.watch(folder, cursor, agentName);
+  await watcher.waitForReady(cursor);
+  return { promise, cursorId: cursor };
+}
+
 describe('FileWatcherService', () => {
   let vaultPath: string;
   let configService: WatchConfigService;
@@ -97,11 +114,8 @@ describe('FileWatcherService', () => {
 
   describe('watch', () => {
     it('detects sidecar file creation', async () => {
-      // Start watch, then write a sidecar file after a short delay
-      const watchPromise = watcher.watch('project', undefined, 'Claude');
+      const { promise: watchPromise } = await watchReady(watcher, 'project', undefined, 'Claude');
 
-      // Write a sidecar file after a brief pause
-      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(
         join(vaultPath, 'project', 'note.md.comments.json'),
         JSON.stringify({ version: 1, comments: [] })
@@ -120,10 +134,8 @@ describe('FileWatcherService', () => {
       const sidecarPath = join(vaultPath, 'project', 'note.md.comments.json');
       await writeFile(sidecarPath, JSON.stringify({ version: 1, comments: [] }));
 
-      // Start watch, then modify
-      const watchPromise = watcher.watch('project', undefined, 'Claude');
+      const { promise: watchPromise } = await watchReady(watcher, 'project', undefined, 'Claude');
 
-      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(sidecarPath, JSON.stringify({ version: 1, comments: [{ id: 'c_1' }] }));
 
       const result = await watchPromise;
@@ -140,10 +152,9 @@ describe('FileWatcherService', () => {
       await shortConfigService.loadConfig();
       const shortWatcher = new FileWatcherService(vaultPath, shortConfigService);
 
-      const watchPromise = shortWatcher.watch('project', undefined, 'test');
+      const { promise: watchPromise } = await watchReady(shortWatcher, 'project', undefined, 'test');
 
       // Write a non-sidecar file
-      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(join(vaultPath, 'project', 'note.md'), '# Hello');
 
       // Wait a bit — if the watcher incorrectly triggered on .md, it would have resolved
@@ -162,9 +173,8 @@ describe('FileWatcherService', () => {
     });
 
     it('returns cursor for subsequent calls', async () => {
-      const watchPromise = watcher.watch('project', undefined, 'Claude');
+      const { promise: watchPromise, cursorId } = await watchReady(watcher, 'project', undefined, 'Claude');
 
-      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(
         join(vaultPath, 'project', 'note.md.comments.json'),
         JSON.stringify({ version: 1, comments: [] })
@@ -172,11 +182,11 @@ describe('FileWatcherService', () => {
 
       const result = await watchPromise;
       const cursor = result.cursor;
+      expect(cursor).toBe(cursorId);
 
       // Use cursor for second watch
-      const watch2Promise = watcher.watch('project', cursor, 'Claude');
+      const { promise: watch2Promise } = await watchReady(watcher, 'project', cursor, 'Claude');
 
-      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(
         join(vaultPath, 'project', 'note.md.comments.json'),
         JSON.stringify({ version: 1, comments: [{ id: 'c_new' }] })
@@ -188,9 +198,8 @@ describe('FileWatcherService', () => {
     });
 
     it('treats invalid cursor as first call', async () => {
-      const watchPromise = watcher.watch('project', 'w_bogus', 'Claude');
+      const { promise: watchPromise } = await watchReady(watcher, 'project', 'w_bogus', 'Claude');
 
-      await new Promise(resolve => setTimeout(resolve, 100));
       await writeFile(
         join(vaultPath, 'project', 'note.md.comments.json'),
         JSON.stringify({ version: 1, comments: [] })
@@ -300,9 +309,7 @@ describe('FileWatcherService', () => {
 
   describe('debouncing', () => {
     it('collects rapid changes into single result', async () => {
-      const watchPromise = watcher.watch('project', undefined, 'Claude');
-
-      await new Promise(resolve => setTimeout(resolve, 50));
+      const { promise: watchPromise } = await watchReady(watcher, 'project', undefined, 'Claude');
 
       // Write multiple sidecar files rapidly
       await writeFile(

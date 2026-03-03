@@ -1,4 +1,4 @@
-import { watch, type FSWatcher } from 'node:fs';
+import chokidar, { type FSWatcher } from 'chokidar';
 import { resolve } from 'path';
 import { WatchConfigService } from './config.js';
 import type { CursorState, SeenCommentState } from './types.js';
@@ -101,7 +101,7 @@ export class FileWatcherService {
 
       const cleanup = () => {
         if (activeWatch.watcher) {
-          activeWatch.watcher.close();
+          activeWatch.watcher.close().catch(() => {});
           activeWatch.watcher = null;
         }
         if (activeWatch.timer) {
@@ -133,60 +133,51 @@ export class FileWatcherService {
       };
       this.activeWatches.set(cursor.id, activeWatch);
 
-      // Set up timeout
-      activeWatch.timer = setTimeout(() => {
-        complete({
-          changedFiles: [],
-          timedOut: true,
-          sessionExpired: false,
-          watchError: false,
-          cursor: cursor.id,
-        });
-      }, config.pollTimeout * 1000);
+      // Set up chokidar watcher — works cross-platform (macOS, Windows, Linux)
+      activeWatch.watcher = chokidar.watch('.', {
+        cwd: fullFolder,
+        ignoreInitial: true,
+      });
 
-      // Set up fs.watch
-      // Note: { recursive: true } is supported on macOS (FSEvents) and Windows.
-      // On Linux, it may silently degrade to non-recursive. If cross-platform
-      // recursive watching is needed, consider chokidar.
-      try {
-        activeWatch.watcher = watch(fullFolder, { recursive: true }, (_eventType, filename) => {
-          if (!filename || !filename.endsWith(SIDECAR_SUFFIX)) return;
+      activeWatch.watcher.on('all', (_event: string, filePath: string) => {
+        if (!filePath.endsWith(SIDECAR_SUFFIX)) return;
+        changedFiles.add(filePath);
 
-          changedFiles.add(filename);
-
-          // Debounce: wait 100ms after last change before resolving
-          if (activeWatch.debounceTimer) clearTimeout(activeWatch.debounceTimer);
-          activeWatch.debounceTimer = setTimeout(() => {
-            complete({
-              changedFiles: [...changedFiles],
-              timedOut: false,
-              sessionExpired: false,
-              watchError: false,
-              cursor: cursor.id,
-            });
-          }, 100);
-        });
-
-        activeWatch.watcher.on('error', () => {
+        // Debounce: wait 100ms after last change before resolving
+        if (activeWatch.debounceTimer) clearTimeout(activeWatch.debounceTimer);
+        activeWatch.debounceTimer = setTimeout(() => {
           complete({
-            changedFiles: [],
+            changedFiles: [...changedFiles],
             timedOut: false,
             sessionExpired: false,
-            watchError: true,
+            watchError: false,
             cursor: cursor.id,
           });
-        });
-      } catch {
-        // fs.watch failed to start
-        cleanup();
-        resolvePromise({
+        }, 100);
+      });
+
+      activeWatch.watcher.on('error', () => {
+        complete({
           changedFiles: [],
           timedOut: false,
           sessionExpired: false,
           watchError: true,
           cursor: cursor.id,
         });
-      }
+      });
+
+      // Start timeout only after chokidar is ready (initial scan complete)
+      activeWatch.watcher.on('ready', () => {
+        activeWatch.timer = setTimeout(() => {
+          complete({
+            changedFiles: [],
+            timedOut: true,
+            sessionExpired: false,
+            watchError: false,
+            cursor: cursor.id,
+          });
+        }, config.pollTimeout * 1000);
+      });
     });
   }
 
@@ -223,7 +214,7 @@ export class FileWatcherService {
     const activeWatch = this.activeWatches.get(cursorId);
     if (activeWatch) {
       if (activeWatch.watcher) {
-        activeWatch.watcher.close();
+        activeWatch.watcher.close().catch(() => {});
         activeWatch.watcher = null;
       }
       if (activeWatch.timer) {
@@ -251,6 +242,23 @@ export class FileWatcherService {
 
   getActiveWatchCount(): number {
     return this.activeWatches.size;
+  }
+
+  /**
+   * Wait for a specific watch to become ready (chokidar initial scan complete).
+   * Useful for testing. Returns false if cursor not found or no active watch.
+   */
+  waitForReady(cursorId: string): Promise<boolean> {
+    const activeWatch = this.activeWatches.get(cursorId);
+    if (!activeWatch?.watcher) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      // If timer is already set, ready has already fired
+      if (activeWatch.timer) {
+        resolve(true);
+        return;
+      }
+      activeWatch.watcher!.on('ready', () => resolve(true));
+    });
   }
 
   cleanupExpiredSessions(maxSessionTimeout: number): number {
