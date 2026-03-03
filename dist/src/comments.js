@@ -246,10 +246,11 @@ export class CommentService {
             status: targetStatus,
         };
     }
-    async listCommentedNotes(params = {}) {
-        const searchDir = params.path || '';
-        const fullSearchDir = this.resolvePath(searchDir);
-        const notes = [];
+    /**
+     * Recursively scan a folder for sidecar files and invoke a callback for each.
+     */
+    async scanSidecars(folder, callback) {
+        const fullFolder = this.resolvePath(folder);
         const scan = async (dirPath, relativePath) => {
             let entries;
             try {
@@ -261,47 +262,52 @@ export class CommentService {
             for (const entry of entries) {
                 const entryRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
                 if (entry.isDirectory()) {
-                    // Skip ignored directories
                     if (this.pathFilter.isAllowed(entryRelativePath + '/')) {
                         await scan(join(dirPath, entry.name), entryRelativePath);
                     }
                 }
                 else if (entry.name.endsWith(SIDECAR_PATTERN)) {
-                    // Found a sidecar file
                     if (!this.pathFilter.isSidecarAllowed(entryRelativePath, SIDECAR_PATTERN)) {
                         continue;
                     }
                     try {
                         const content = await readFile(join(dirPath, entry.name), 'utf-8');
                         const commentFile = JSON.parse(content);
-                        if (!commentFile.comments || commentFile.comments.length === 0) {
-                            continue;
-                        }
-                        const metadata = this.recalculateMetadata(commentFile.comments);
                         const notePath = entryRelativePath.slice(0, -SIDECAR_PATTERN.length);
-                        // Apply status filter
-                        if (params.status) {
-                            const matchingCount = commentFile.comments.filter(c => c.status === params.status).length;
-                            if (matchingCount === 0)
-                                continue;
-                        }
-                        notes.push({
-                            path: notePath,
-                            total: metadata.total_comments,
-                            open: metadata.open_count,
-                            resolved: metadata.resolved_count,
-                            authors: metadata.authors,
-                            lastActivity: commentFile.updated_at,
-                        });
+                        callback(commentFile, notePath);
                     }
                     catch {
-                        // Malformed sidecar — skip silently
+                        // Malformed sidecar — skip
                         continue;
                     }
                 }
             }
         };
-        await scan(fullSearchDir, searchDir);
+        await scan(fullFolder, folder);
+    }
+    async listCommentedNotes(params = {}) {
+        const searchDir = params.path || '';
+        const notes = [];
+        await this.scanSidecars(searchDir, (commentFile, notePath) => {
+            if (!commentFile.comments || commentFile.comments.length === 0) {
+                return;
+            }
+            const metadata = this.recalculateMetadata(commentFile.comments);
+            // Apply status filter
+            if (params.status) {
+                const matchingCount = commentFile.comments.filter(c => c.status === params.status).length;
+                if (matchingCount === 0)
+                    return;
+            }
+            notes.push({
+                path: notePath,
+                total: metadata.total_comments,
+                open: metadata.open_count,
+                resolved: metadata.resolved_count,
+                authors: metadata.authors,
+                lastActivity: commentFile.updated_at,
+            });
+        });
         // Sort by open count descending
         notes.sort((a, b) => b.open - a.open);
         let totalOpen = 0;
@@ -317,6 +323,106 @@ export class CommentService {
                 totalOpen,
                 totalResolved,
             },
+        };
+    }
+    // ===========================================================================
+    // WATCH SUPPORT — Needs-attention filtering and diffing
+    // ===========================================================================
+    /**
+     * Determine if a comment thread needs attention from the AI.
+     * A comment needs attention when the last message in the thread
+     * is NOT from an excluded author.
+     */
+    needsAttention(comment, excludeAuthors) {
+        if (comment.status === 'resolved')
+            return false;
+        // Determine the last message author
+        const lastMessage = comment.replies.length > 0
+            ? comment.replies[comment.replies.length - 1]
+            : comment;
+        const authorLower = lastMessage.author.toLowerCase();
+        return !excludeAuthors.some(a => a.toLowerCase() === authorLower);
+    }
+    /**
+     * Scan a folder for all comments that currently need attention.
+     * Used on first watch call (no cursor) to find actionable comments.
+     */
+    async getActionableComments(folder, excludeAuthors) {
+        const actionable = [];
+        await this.scanSidecars(folder, (commentFile, notePath) => {
+            for (const comment of commentFile.comments) {
+                if (this.needsAttention(comment, excludeAuthors)) {
+                    actionable.push(this.toActionableComment(comment, notePath, 'created'));
+                }
+            }
+        });
+        return actionable;
+    }
+    /**
+     * Given changed sidecar files and a cursor state, return only comments
+     * that newly need attention since the cursor was last checked.
+     */
+    getNewActionableComments(commentFile, notePath, seenComments, excludeAuthors) {
+        const actionable = [];
+        for (const comment of commentFile.comments) {
+            const seen = seenComments.get(comment.id);
+            let action = null;
+            if (!seen) {
+                // New comment
+                action = 'created';
+            }
+            else if (seen.status === 'resolved' && comment.status === 'open') {
+                // Was resolved, now reopened
+                action = 'reopened';
+            }
+            else if (comment.replies.length > seen.replyCount) {
+                // New replies added
+                action = 'reply_added';
+            }
+            if (action && this.needsAttention(comment, excludeAuthors)) {
+                actionable.push(this.toActionableComment(comment, notePath, action));
+            }
+        }
+        return actionable;
+    }
+    /**
+     * Build a snapshot of seen comment states for cursor tracking.
+     */
+    buildSeenComments(commentFile) {
+        const seen = new Map();
+        for (const comment of commentFile.comments) {
+            seen.set(comment.id, {
+                replyCount: comment.replies.length,
+                status: comment.status,
+                lastActivityAt: comment.last_activity_at,
+            });
+        }
+        return seen;
+    }
+    /**
+     * Scan a folder for all sidecar files and build a combined seen-state map.
+     * Used by the server to initialize cursor state on first watch call.
+     */
+    async buildSeenStateForFolder(folder) {
+        const seenComments = new Map();
+        await this.scanSidecars(folder, (commentFile) => {
+            const fileSeen = this.buildSeenComments(commentFile);
+            for (const [id, state] of fileSeen) {
+                seenComments.set(id, state);
+            }
+        });
+        return seenComments;
+    }
+    toActionableComment(comment, notePath, action) {
+        return {
+            id: comment.id,
+            note: notePath,
+            author: comment.author,
+            content: comment.content,
+            location: comment.location,
+            createdAt: comment.created_at,
+            action,
+            replies: comment.replies,
         };
     }
 }
