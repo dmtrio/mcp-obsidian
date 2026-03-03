@@ -60,7 +60,7 @@ export class WatchConfigService {
         DEFAULTS.pollTimeout
       ),
       sessionTimeout: this.validateNumber(
-        watchSection.sessionTimeout ?? this.cliArgs.sessionTimeout ?? DEFAULTS.sessionTimeout,
+        this.cliArgs.sessionTimeout ?? watchSection.sessionTimeout ?? DEFAULTS.sessionTimeout,
         LIMITS.sessionTimeout,
         'sessionTimeout',
         DEFAULTS.sessionTimeout
@@ -107,7 +107,7 @@ export class WatchConfigService {
   }
 
   getConfig(): WatchConfig {
-    return this.config;
+    return { ...this.config, agents: { ...this.config.agents } };
   }
 
   private validateNumber(
