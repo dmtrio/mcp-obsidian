@@ -74,15 +74,14 @@ const author = authorIndex !== -1 && process.argv[authorIndex + 1]
   : 'mcp-obsidian';
 
 // Parse --watch-poll-timeout and --watch-session-timeout flags
-const pollTimeoutIndex = process.argv.indexOf('--watch-poll-timeout');
-const cliPollTimeout = pollTimeoutIndex !== -1 && process.argv[pollTimeoutIndex + 1]
-  ? parseInt(process.argv[pollTimeoutIndex + 1]!, 10)
-  : undefined;
-
-const sessionTimeoutIndex = process.argv.indexOf('--watch-session-timeout');
-const cliSessionTimeout = sessionTimeoutIndex !== -1 && process.argv[sessionTimeoutIndex + 1]
-  ? parseInt(process.argv[sessionTimeoutIndex + 1]!, 10)
-  : undefined;
+function parseIntArg(flag: string): number | undefined {
+  const index = process.argv.indexOf(flag);
+  if (index === -1 || !process.argv[index + 1]) return undefined;
+  const value = parseInt(process.argv[index + 1]!, 10);
+  return Number.isFinite(value) ? value : undefined;
+}
+const cliPollTimeout = parseIntArg('--watch-poll-timeout');
+const cliSessionTimeout = parseIntArg('--watch-session-timeout');
 
 // Initialize services
 const pathFilter = new PathFilter({ sidecarPatterns: ['.comments.json'] });
@@ -606,42 +605,6 @@ function trimPaths(args: any): any {
   return trimmed;
 }
 
-// Helper to scan sidecar files and build initial cursor state
-async function scanSidecarsForCursor(
-  dirPath: string,
-  relativePath: string,
-  seenComments: Map<string, SeenCommentState>
-): Promise<void> {
-  const { readdir } = await import('node:fs/promises');
-  let entries;
-  try {
-    entries = await readdir(dirPath, { withFileTypes: true });
-  } catch {
-    return;
-  }
-
-  for (const entry of entries) {
-    const entryRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
-
-    if (entry.isDirectory()) {
-      if (pathFilter.isAllowed(entryRelativePath + '/')) {
-        await scanSidecarsForCursor(join(dirPath, entry.name), entryRelativePath, seenComments);
-      }
-    } else if (entry.name.endsWith('.comments.json')) {
-      try {
-        const content = await readFile(join(dirPath, entry.name), 'utf-8');
-        const commentFile = JSON.parse(content) as CommentFile;
-        const fileSeen = commentService.buildSeenComments(commentFile);
-        for (const [id, state] of fileSeen) {
-          seenComments.set(id, state);
-        }
-      } catch {
-        continue;
-      }
-    }
-  }
-}
-
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   const trimmedArgs = trimPaths(args);
@@ -953,6 +916,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const watchPath = trimmedArgs.path || '';
         const cursor = trimmedArgs.cursor;
         const excludeAuthors: string[] = trimmedArgs.excludeAuthors || [];
+        // Convention: agent identity is inferred from excludeAuthors[0].
+        // This drives per-agent config resolution (e.g., custom poll timeouts).
+        // Future: may be replaced with an explicit agent identity parameter.
         const agentName = excludeAuthors.length > 0 ? excludeAuthors[0] : undefined;
 
         // On first call (no cursor), check for existing actionable comments
@@ -960,12 +926,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const existing = await commentService.getActionableComments(watchPath, excludeAuthors);
           if (existing.length > 0) {
             // Create cursor and snapshot current state
-            const newCursor = await watcherService.createCursor(watchPath, agentName || 'unknown');
+            const newCursor = watcherService.createCursor(watchPath, agentName || 'unknown');
 
             // Build seen state from all sidecars in folder
-            const seenComments = new Map<string, SeenCommentState>();
-            const fullFolder = join(vaultPath, watchPath);
-            await scanSidecarsForCursor(fullFolder, watchPath, seenComments);
+            const seenComments = await commentService.buildSeenStateForFolder(watchPath);
             watcherService.updateCursor(newCursor.id, seenComments);
 
             return {
@@ -1008,6 +972,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 cursor: watchResult.cursor,
                 comments: [],
                 watchedPath: watchPath,
+              })
+            }]
+          };
+        }
+
+        if (watchResult.watchError) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "error",
+                cursor: watchResult.cursor,
+                comments: [],
+                watchedPath: watchPath,
+                error: "File watcher encountered an error. Retry the watch call.",
               })
             }]
           };

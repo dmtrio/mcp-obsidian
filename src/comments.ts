@@ -499,6 +499,23 @@ export class CommentService {
     return seen;
   }
 
+  /**
+   * Scan a folder for all sidecar files and build a combined seen-state map.
+   * Used by the server to initialize cursor state on first watch call.
+   */
+  async buildSeenStateForFolder(folder: string): Promise<Map<string, SeenCommentState>> {
+    const seenComments = new Map<string, SeenCommentState>();
+
+    await this.scanSidecars(folder, (commentFile) => {
+      const fileSeen = this.buildSeenComments(commentFile);
+      for (const [id, state] of fileSeen) {
+        seenComments.set(id, state);
+      }
+    });
+
+    return seenComments;
+  }
+
   private toActionableComment(
     comment: Comment,
     notePath: string,
