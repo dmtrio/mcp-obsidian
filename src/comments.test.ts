@@ -685,6 +685,13 @@ describe('CommentService', () => {
       ]);
       expect(service.needsAttention(comment, ['Claude', 'ChatGPT'])).toBe(false);
     });
+
+    it('matches excluded authors case-insensitively', () => {
+      const comment = makeComment('human', 'open', [
+        { author: 'claude', content: 'AI reply' }
+      ]);
+      expect(service.needsAttention(comment, ['Claude'])).toBe(false);
+    });
   });
 
   // ============================================================================

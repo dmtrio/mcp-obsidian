@@ -314,11 +314,14 @@ export class CommentService {
     };
   }
 
-  async listCommentedNotes(params: ListCommentedNotesParams = {}): Promise<ListCommentedNotesResult> {
-    const searchDir = params.path || '';
-    const fullSearchDir = this.resolvePath(searchDir);
-
-    const notes: CommentedNoteSummary[] = [];
+  /**
+   * Recursively scan a folder for sidecar files and invoke a callback for each.
+   */
+  private async scanSidecars(
+    folder: string,
+    callback: (commentFile: CommentFile, notePath: string) => void
+  ): Promise<void> {
+    const fullFolder = this.resolvePath(folder);
 
     const scan = async (dirPath: string, relativePath: string): Promise<void> => {
       let entries;
@@ -332,12 +335,10 @@ export class CommentService {
         const entryRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
 
         if (entry.isDirectory()) {
-          // Skip ignored directories
           if (this.pathFilter.isAllowed(entryRelativePath + '/')) {
             await scan(join(dirPath, entry.name), entryRelativePath);
           }
         } else if (entry.name.endsWith(SIDECAR_PATTERN)) {
-          // Found a sidecar file
           if (!this.pathFilter.isSidecarAllowed(entryRelativePath, SIDECAR_PATTERN)) {
             continue;
           }
@@ -345,37 +346,45 @@ export class CommentService {
           try {
             const content = await readFile(join(dirPath, entry.name), 'utf-8');
             const commentFile = JSON.parse(content) as CommentFile;
-
-            if (!commentFile.comments || commentFile.comments.length === 0) {
-              continue;
-            }
-
-            const metadata = this.recalculateMetadata(commentFile.comments);
             const notePath = entryRelativePath.slice(0, -SIDECAR_PATTERN.length);
-
-            // Apply status filter
-            if (params.status) {
-              const matchingCount = commentFile.comments.filter(c => c.status === params.status).length;
-              if (matchingCount === 0) continue;
-            }
-
-            notes.push({
-              path: notePath,
-              total: metadata.total_comments,
-              open: metadata.open_count,
-              resolved: metadata.resolved_count,
-              authors: metadata.authors,
-              lastActivity: commentFile.updated_at,
-            });
+            callback(commentFile, notePath);
           } catch {
-            // Malformed sidecar — skip silently
+            // Malformed sidecar — skip
             continue;
           }
         }
       }
     };
 
-    await scan(fullSearchDir, searchDir);
+    await scan(fullFolder, folder);
+  }
+
+  async listCommentedNotes(params: ListCommentedNotesParams = {}): Promise<ListCommentedNotesResult> {
+    const searchDir = params.path || '';
+    const notes: CommentedNoteSummary[] = [];
+
+    await this.scanSidecars(searchDir, (commentFile, notePath) => {
+      if (!commentFile.comments || commentFile.comments.length === 0) {
+        return;
+      }
+
+      const metadata = this.recalculateMetadata(commentFile.comments);
+
+      // Apply status filter
+      if (params.status) {
+        const matchingCount = commentFile.comments.filter(c => c.status === params.status).length;
+        if (matchingCount === 0) return;
+      }
+
+      notes.push({
+        path: notePath,
+        total: metadata.total_comments,
+        open: metadata.open_count,
+        resolved: metadata.resolved_count,
+        authors: metadata.authors,
+        lastActivity: commentFile.updated_at,
+      });
+    });
 
     // Sort by open count descending
     notes.sort((a, b) => b.open - a.open);
@@ -414,7 +423,8 @@ export class CommentService {
       ? comment.replies[comment.replies.length - 1]!
       : comment;
 
-    return !excludeAuthors.includes(lastMessage.author);
+    const authorLower = lastMessage.author.toLowerCase();
+    return !excludeAuthors.some(a => a.toLowerCase() === authorLower);
   }
 
   /**
@@ -426,47 +436,15 @@ export class CommentService {
     excludeAuthors: string[]
   ): Promise<ActionableComment[]> {
     const actionable: ActionableComment[] = [];
-    const fullFolder = this.resolvePath(folder);
 
-    const scan = async (dirPath: string, relativePath: string): Promise<void> => {
-      let entries;
-      try {
-        entries = await readdir(dirPath, { withFileTypes: true });
-      } catch {
-        return;
-      }
-
-      for (const entry of entries) {
-        const entryRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
-
-        if (entry.isDirectory()) {
-          if (this.pathFilter.isAllowed(entryRelativePath + '/')) {
-            await scan(join(dirPath, entry.name), entryRelativePath);
-          }
-        } else if (entry.name.endsWith(SIDECAR_PATTERN)) {
-          if (!this.pathFilter.isSidecarAllowed(entryRelativePath, SIDECAR_PATTERN)) {
-            continue;
-          }
-
-          try {
-            const content = await readFile(join(dirPath, entry.name), 'utf-8');
-            const commentFile = JSON.parse(content) as CommentFile;
-            const notePath = entryRelativePath.slice(0, -SIDECAR_PATTERN.length);
-
-            for (const comment of commentFile.comments) {
-              if (this.needsAttention(comment, excludeAuthors)) {
-                actionable.push(this.toActionableComment(comment, notePath, 'created'));
-              }
-            }
-          } catch {
-            // Malformed sidecar — skip
-            continue;
-          }
+    await this.scanSidecars(folder, (commentFile, notePath) => {
+      for (const comment of commentFile.comments) {
+        if (this.needsAttention(comment, excludeAuthors)) {
+          actionable.push(this.toActionableComment(comment, notePath, 'created'));
         }
       }
-    };
+    });
 
-    await scan(fullFolder, folder);
     return actionable;
   }
 
