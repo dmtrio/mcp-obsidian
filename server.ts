@@ -11,9 +11,13 @@ import { FrontmatterHandler } from "./src/frontmatter.js";
 import { PathFilter } from "./src/pathfilter.js";
 import { SearchService } from "./src/search.js";
 import { CommentService } from "./src/comments.js";
+import { WatchConfigService } from "./src/config.js";
+import { FileWatcherService } from "./src/watcher.js";
 import { readFileSync } from "fs";
+import { readFile } from "fs/promises";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import type { CommentFile, SeenCommentState } from "./src/types.js";
 
 // Get package.json version
 const __filename = fileURLToPath(import.meta.url);
@@ -43,9 +47,11 @@ Arguments:
   <vault-path>    Path to your Obsidian vault directory
 
 Options:
-  --author <name>  Author name for comments (default: "mcp-obsidian")
-  --version, -v    Show version number
-  --help, -h       Show this help message
+  --author <name>                Author name for comments (default: "mcp-obsidian")
+  --watch-poll-timeout <secs>    Watch poll timeout in seconds (default: 300)
+  --watch-session-timeout <secs> Watch session timeout in seconds (default: 3600)
+  --version, -v                  Show version number
+  --help, -h                     Show this help message
 
 Examples:
   npx @mauricio.wolff/mcp-obsidian ~/Documents/MyVault
@@ -67,12 +73,28 @@ const author = authorIndex !== -1 && process.argv[authorIndex + 1]
   ? process.argv[authorIndex + 1]!
   : 'mcp-obsidian';
 
+// Parse --watch-poll-timeout and --watch-session-timeout flags
+function parseIntArg(flag: string): number | undefined {
+  const index = process.argv.indexOf(flag);
+  if (index === -1 || !process.argv[index + 1]) return undefined;
+  const value = parseInt(process.argv[index + 1]!, 10);
+  return Number.isFinite(value) ? value : undefined;
+}
+const cliPollTimeout = parseIntArg('--watch-poll-timeout');
+const cliSessionTimeout = parseIntArg('--watch-session-timeout');
+
 // Initialize services
 const pathFilter = new PathFilter({ sidecarPatterns: ['.comments.json'] });
 const frontmatterHandler = new FrontmatterHandler();
 const fileSystem = new FileSystemService(vaultPath, pathFilter, frontmatterHandler);
 const searchService = new SearchService(vaultPath, pathFilter);
 const commentService = new CommentService(vaultPath, pathFilter, author, VERSION);
+const cliWatchArgs: { pollTimeout?: number; sessionTimeout?: number } = {};
+if (cliPollTimeout !== undefined) cliWatchArgs.pollTimeout = cliPollTimeout;
+if (cliSessionTimeout !== undefined) cliWatchArgs.sessionTimeout = cliSessionTimeout;
+const watchConfigService = new WatchConfigService(vaultPath, cliWatchArgs);
+await watchConfigService.loadConfig();
+const watcherService = new FileWatcherService(vaultPath, watchConfigService);
 
 const server = new Server({
   name: "mcp-obsidian",
@@ -527,6 +549,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           }
         }
+      },
+      {
+        name: "watch_comments",
+        description: "Watch a folder for new comments that need attention. Long-polls until a human leaves a comment or reply, then returns the actionable comments. Use this after writing a note for review — call it in a loop to reactively respond to feedback. Pass the cursor from each response to the next call to track what you've already seen. Timeouts and session limits are server-controlled.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Folder path to watch for comment activity (relative to vault root)"
+            },
+            cursor: {
+              type: "string",
+              description: "Opaque cursor from a previous watch_comments response. Omit on first call."
+            },
+            excludeAuthors: {
+              type: "array",
+              items: { type: "string" },
+              description: "Authors to ignore (pass your own author name to avoid reacting to your own replies)"
+            }
+          },
+          required: ["path"]
+        }
       }
     ]
   };
@@ -864,6 +909,151 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               text: JSON.stringify(result, null, indent)
             }
           ]
+        };
+      }
+
+      case "watch_comments": {
+        const watchPath = trimmedArgs.path || '';
+        const cursor = trimmedArgs.cursor;
+        const excludeAuthors: string[] = trimmedArgs.excludeAuthors || [];
+        // Convention: agent identity is inferred from excludeAuthors[0].
+        // This drives per-agent config resolution (e.g., custom poll timeouts).
+        // Future: may be replaced with an explicit agent identity parameter.
+        const agentName = excludeAuthors.length > 0 ? excludeAuthors[0] : undefined;
+
+        // On first call (no cursor), check for existing actionable comments
+        if (!cursor) {
+          const existing = await commentService.getActionableComments(watchPath, excludeAuthors);
+          if (existing.length > 0) {
+            // Create cursor and snapshot current state
+            const newCursor = watcherService.createCursor(watchPath, agentName || 'unknown');
+
+            // Build seen state from all sidecars in folder
+            const seenComments = await commentService.buildSeenStateForFolder(watchPath);
+            watcherService.updateCursor(newCursor.id, seenComments);
+
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  status: "changed",
+                  cursor: newCursor.id,
+                  comments: existing,
+                  watchedPath: watchPath,
+                })
+              }]
+            };
+          }
+        }
+
+        // Watch for changes (blocks until change, timeout, or session expiry)
+        const watchResult = await watcherService.watch(watchPath, cursor, agentName);
+
+        if (watchResult.sessionExpired) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "session_expired",
+                cursor: null,
+                comments: [],
+                watchedPath: watchPath,
+              })
+            }]
+          };
+        }
+
+        if (watchResult.timedOut) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "timeout",
+                cursor: watchResult.cursor,
+                comments: [],
+                watchedPath: watchPath,
+              })
+            }]
+          };
+        }
+
+        if (watchResult.watchError) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "error",
+                cursor: watchResult.cursor,
+                comments: [],
+                watchedPath: watchPath,
+                error: "File watcher encountered an error. Retry the watch call.",
+              })
+            }]
+          };
+        }
+
+        // Process changed files
+        const actionableComments = [];
+        const allSeenComments = new Map<string, SeenCommentState>();
+        const cursorState = watcherService.decodeCursor(watchResult.cursor);
+        const previousSeen = cursorState?.seenComments || new Map();
+
+        for (const changedFile of watchResult.changedFiles) {
+          try {
+            const sidecarFullPath = join(vaultPath, watchPath, changedFile);
+            const content = await readFile(sidecarFullPath, 'utf-8');
+            const commentFile = JSON.parse(content) as CommentFile;
+            const notePath = changedFile.slice(0, -'.comments.json'.length);
+
+            const newActionable = commentService.getNewActionableComments(
+              commentFile, notePath, previousSeen, excludeAuthors
+            );
+            actionableComments.push(...newActionable);
+
+            // Update seen state
+            const fileSeen = commentService.buildSeenComments(commentFile);
+            for (const [id, state] of fileSeen) {
+              allSeenComments.set(id, state);
+            }
+          } catch {
+            // Malformed or deleted sidecar — skip
+            continue;
+          }
+        }
+
+        // Merge new seen state with previous
+        for (const [id, state] of previousSeen) {
+          if (!allSeenComments.has(id)) {
+            allSeenComments.set(id, state);
+          }
+        }
+        watcherService.updateCursor(watchResult.cursor, allSeenComments);
+
+        // If no actionable comments after filtering (echo), return timeout-like response
+        if (actionableComments.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "timeout",
+                cursor: watchResult.cursor,
+                comments: [],
+                watchedPath: watchPath,
+              })
+            }]
+          };
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              status: "changed",
+              cursor: watchResult.cursor,
+              comments: actionableComments,
+              watchedPath: watchPath,
+            })
+          }]
         };
       }
 
