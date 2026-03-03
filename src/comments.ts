@@ -18,6 +18,9 @@ import type {
   ListCommentedNotesParams,
   ListCommentedNotesResult,
   CommentedNoteSummary,
+  ActionableComment,
+  WatchCommentAction,
+  SeenCommentState,
 } from './types.js';
 import { OBSIDIAN_ANNOTATED_SCHEMA_VERSION } from './types.js';
 
@@ -391,6 +394,147 @@ export class CommentService {
         totalOpen,
         totalResolved,
       },
+    };
+  }
+
+  // ===========================================================================
+  // WATCH SUPPORT — Needs-attention filtering and diffing
+  // ===========================================================================
+
+  /**
+   * Determine if a comment thread needs attention from the AI.
+   * A comment needs attention when the last message in the thread
+   * is NOT from an excluded author.
+   */
+  needsAttention(comment: Comment, excludeAuthors: string[]): boolean {
+    if (comment.status === 'resolved') return false;
+
+    // Determine the last message author
+    const lastMessage = comment.replies.length > 0
+      ? comment.replies[comment.replies.length - 1]!
+      : comment;
+
+    return !excludeAuthors.includes(lastMessage.author);
+  }
+
+  /**
+   * Scan a folder for all comments that currently need attention.
+   * Used on first watch call (no cursor) to find actionable comments.
+   */
+  async getActionableComments(
+    folder: string,
+    excludeAuthors: string[]
+  ): Promise<ActionableComment[]> {
+    const actionable: ActionableComment[] = [];
+    const fullFolder = this.resolvePath(folder);
+
+    const scan = async (dirPath: string, relativePath: string): Promise<void> => {
+      let entries;
+      try {
+        entries = await readdir(dirPath, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      for (const entry of entries) {
+        const entryRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+
+        if (entry.isDirectory()) {
+          if (this.pathFilter.isAllowed(entryRelativePath + '/')) {
+            await scan(join(dirPath, entry.name), entryRelativePath);
+          }
+        } else if (entry.name.endsWith(SIDECAR_PATTERN)) {
+          if (!this.pathFilter.isSidecarAllowed(entryRelativePath, SIDECAR_PATTERN)) {
+            continue;
+          }
+
+          try {
+            const content = await readFile(join(dirPath, entry.name), 'utf-8');
+            const commentFile = JSON.parse(content) as CommentFile;
+            const notePath = entryRelativePath.slice(0, -SIDECAR_PATTERN.length);
+
+            for (const comment of commentFile.comments) {
+              if (this.needsAttention(comment, excludeAuthors)) {
+                actionable.push(this.toActionableComment(comment, notePath, 'created'));
+              }
+            }
+          } catch {
+            // Malformed sidecar — skip
+            continue;
+          }
+        }
+      }
+    };
+
+    await scan(fullFolder, folder);
+    return actionable;
+  }
+
+  /**
+   * Given changed sidecar files and a cursor state, return only comments
+   * that newly need attention since the cursor was last checked.
+   */
+  getNewActionableComments(
+    commentFile: CommentFile,
+    notePath: string,
+    seenComments: Map<string, SeenCommentState>,
+    excludeAuthors: string[]
+  ): ActionableComment[] {
+    const actionable: ActionableComment[] = [];
+
+    for (const comment of commentFile.comments) {
+      const seen = seenComments.get(comment.id);
+
+      let action: WatchCommentAction | null = null;
+
+      if (!seen) {
+        // New comment
+        action = 'created';
+      } else if (seen.status === 'resolved' && comment.status === 'open') {
+        // Was resolved, now reopened
+        action = 'reopened';
+      } else if (comment.replies.length > seen.replyCount) {
+        // New replies added
+        action = 'reply_added';
+      }
+
+      if (action && this.needsAttention(comment, excludeAuthors)) {
+        actionable.push(this.toActionableComment(comment, notePath, action));
+      }
+    }
+
+    return actionable;
+  }
+
+  /**
+   * Build a snapshot of seen comment states for cursor tracking.
+   */
+  buildSeenComments(commentFile: CommentFile): Map<string, SeenCommentState> {
+    const seen = new Map<string, SeenCommentState>();
+    for (const comment of commentFile.comments) {
+      seen.set(comment.id, {
+        replyCount: comment.replies.length,
+        status: comment.status,
+        lastActivityAt: comment.last_activity_at,
+      });
+    }
+    return seen;
+  }
+
+  private toActionableComment(
+    comment: Comment,
+    notePath: string,
+    action: WatchCommentAction
+  ): ActionableComment {
+    return {
+      id: comment.id,
+      note: notePath,
+      author: comment.author,
+      content: comment.content,
+      location: comment.location,
+      createdAt: comment.created_at,
+      action,
+      replies: comment.replies,
     };
   }
 }
