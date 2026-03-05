@@ -4,6 +4,8 @@ import { FrontmatterHandler } from "./frontmatter.js";
 import { PathFilter } from "./pathfilter.js";
 import { SearchService } from "./search.js";
 import { CommentService } from "./comments.js";
+import { WatchConfigService } from "./config.js";
+import { FileWatcherService } from "./watcher.js";
 import { writeFile, readFile, mkdir, mkdtemp, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -446,5 +448,268 @@ describe("Performance: Post-PR#12 Overhead", () => {
         const duration = performance.now() - start;
         // Should complete in reasonable time (< 500ms for 50 files)
         expect(duration).toBeLessThan(500);
+    });
+});
+// ============================================================================
+// WATCH COMMENTS INTEGRATION
+// ============================================================================
+describe("Integration: Watch Comments Workflow", () => {
+    let watchConfigService;
+    let watcherService;
+    beforeEach(async () => {
+        // Create watch config with short timeouts for testing
+        await writeFile(join(testVaultPath, ".mcp-obsidian.json"), JSON.stringify({
+            watch: {
+                pollTimeout: 30,
+                sessionTimeout: 300,
+                maxConcurrent: 3,
+                agents: { Claude: { pollTimeout: 60 } },
+            },
+        }));
+        watchConfigService = new WatchConfigService(testVaultPath);
+        await watchConfigService.loadConfig();
+        watcherService = new FileWatcherService(testVaultPath, watchConfigService);
+    });
+    afterEach(() => {
+        watcherService.destroy();
+    });
+    test("full reactive loop: write note, watch, detect comment, respond", async () => {
+        // 1. AI writes a note for review
+        await mkdir(join(testVaultPath, "project"), { recursive: true });
+        await fileSystem.writeNote({
+            path: "project/design.md",
+            content: "# Design Doc\n\nProposal here.\n\nDetails.\n",
+        });
+        // 2. AI starts watching
+        const watchPromise = watcherService.watch("project", undefined, "Claude");
+        // 3. Human leaves a comment (simulated)
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        const humanSidecar = {
+            version: 1,
+            createdBy: "obsidian-annotated@0.1.0",
+            note_path: "project/design.md",
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            comments: [
+                {
+                    id: "c_human_watch1",
+                    author: "bob",
+                    created_at: new Date().toISOString(),
+                    location: {
+                        type: "range",
+                        start_line: 3,
+                        start_char: 0,
+                        end_line: 3,
+                        end_char: 0,
+                    },
+                    content: "What about scalability?",
+                    status: "open",
+                    replies: [],
+                    last_activity_at: new Date().toISOString(),
+                    content_snippet: "Proposal here.",
+                },
+            ],
+            metadata: {
+                total_comments: 1,
+                open_count: 1,
+                resolved_count: 0,
+                authors: ["bob"],
+            },
+        };
+        await writeFile(join(testVaultPath, "project/design.md.comments.json"), JSON.stringify(humanSidecar));
+        // 4. Watch detects the change
+        const watchResult = await watchPromise;
+        expect(watchResult.timedOut).toBe(false);
+        expect(watchResult.sessionExpired).toBe(false);
+        expect(watchResult.changedFiles.length).toBeGreaterThan(0);
+        // 5. Process the changed files through CommentService
+        const sidecarContent = await readFile(join(testVaultPath, "project/design.md.comments.json"), "utf-8");
+        const commentFile = JSON.parse(sidecarContent);
+        const actionable = commentService.getNewActionableComments(commentFile, "project/design.md", new Map(), ["Claude"]);
+        expect(actionable).toHaveLength(1);
+        expect(actionable[0].content).toBe("What about scalability?");
+        expect(actionable[0].action).toBe("created");
+        // 6. AI responds
+        const replyResult = await commentService.replyToComment({
+            path: "project/design.md",
+            commentId: "c_human_watch1",
+            content: "Good point, adding a scalability section.",
+        });
+        expect(replyResult.success).toBe(true);
+    });
+    test("echo suppression: AI's own reply doesn't trigger actionable", async () => {
+        await mkdir(join(testVaultPath, "project"), { recursive: true });
+        await fileSystem.writeNote({
+            path: "project/doc.md",
+            content: "# Doc\nContent\n",
+        });
+        // Human comment already exists, AI already replied
+        const sidecar = {
+            version: 1,
+            createdBy: "test",
+            note_path: "project/doc.md",
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            comments: [
+                {
+                    id: "c_echo_test",
+                    author: "bob",
+                    created_at: new Date().toISOString(),
+                    location: {
+                        type: "range",
+                        start_line: 1,
+                        start_char: 0,
+                        end_line: 1,
+                        end_char: 0,
+                    },
+                    content: "Question",
+                    status: "open",
+                    replies: [
+                        {
+                            id: "r_claude",
+                            author: "claude",
+                            created_at: new Date().toISOString(),
+                            content: "Answer",
+                            status: "open",
+                        },
+                    ],
+                    last_activity_at: new Date().toISOString(),
+                    content_snippet: "# Doc",
+                },
+            ],
+            metadata: {
+                total_comments: 1,
+                open_count: 1,
+                resolved_count: 0,
+                authors: ["bob", "claude"],
+            },
+        };
+        // needsAttention should return false (last reply is from Claude)
+        expect(commentService.needsAttention(sidecar.comments[0], ["claude"])).toBe(false);
+        // getActionableComments should return empty
+        await writeFile(join(testVaultPath, "project/doc.md.comments.json"), JSON.stringify(sidecar));
+        const actionable = await commentService.getActionableComments("project", [
+            "claude",
+        ]);
+        expect(actionable).toHaveLength(0);
+    });
+    test("needs attention after human follow-up to AI reply", async () => {
+        await mkdir(join(testVaultPath, "project"), { recursive: true });
+        await fileSystem.writeNote({
+            path: "project/doc.md",
+            content: "# Doc\nContent\n",
+        });
+        const sidecar = {
+            version: 1,
+            createdBy: "test",
+            note_path: "project/doc.md",
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            comments: [
+                {
+                    id: "c_followup",
+                    author: "bob",
+                    created_at: new Date().toISOString(),
+                    location: {
+                        type: "range",
+                        start_line: 1,
+                        start_char: 0,
+                        end_line: 1,
+                        end_char: 0,
+                    },
+                    content: "Question",
+                    status: "open",
+                    replies: [
+                        {
+                            id: "r_1",
+                            author: "claude",
+                            created_at: new Date().toISOString(),
+                            content: "Answer",
+                            status: "open",
+                        },
+                        {
+                            id: "r_2",
+                            author: "bob",
+                            created_at: new Date().toISOString(),
+                            content: "But what about edge cases?",
+                            status: "open",
+                        },
+                    ],
+                    last_activity_at: new Date().toISOString(),
+                    content_snippet: "# Doc",
+                },
+            ],
+            metadata: {
+                total_comments: 1,
+                open_count: 1,
+                resolved_count: 0,
+                authors: ["bob", "claude"],
+            },
+        };
+        // Should need attention — last reply is from human
+        expect(commentService.needsAttention(sidecar.comments[0], ["claude"])).toBe(true);
+        // Diffing should detect the new reply
+        const seen = new Map([
+            [
+                "c_followup",
+                {
+                    replyCount: 1,
+                    status: "open",
+                    lastActivityAt: new Date().toISOString(),
+                },
+            ],
+        ]);
+        const newActionable = commentService.getNewActionableComments(sidecar, "project/doc.md", seen, ["claude"]);
+        expect(newActionable).toHaveLength(1);
+        expect(newActionable[0].action).toBe("reply_added");
+    });
+    test("cursor continuity across multiple watch cycles", async () => {
+        await mkdir(join(testVaultPath, "project"), { recursive: true });
+        await fileSystem.writeNote({
+            path: "project/doc.md",
+            content: "# Doc\nLine 2\nLine 3\n",
+        });
+        // First watch cycle
+        const watch1 = watcherService.watch("project", undefined, "Claude");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        // First comment
+        await commentService.addComment({
+            path: "project/doc.md",
+            content: "Human comment 1",
+            startLine: 2,
+            endLine: 2,
+        });
+        // Simulate this was from a human by reading and rewriting the sidecar
+        const raw1 = await readFile(join(testVaultPath, "project/doc.md.comments.json"), "utf-8");
+        const cf1 = JSON.parse(raw1);
+        cf1.comments[0].author = "bob";
+        await writeFile(join(testVaultPath, "project/doc.md.comments.json"), JSON.stringify(cf1));
+        const result1 = await watch1;
+        expect(result1.timedOut).toBe(false);
+        const cursor = result1.cursor;
+        // Update cursor with seen state
+        const seen1 = commentService.buildSeenComments(cf1);
+        watcherService.updateCursor(cursor, seen1);
+        // Second watch cycle with cursor
+        const watch2 = watcherService.watch("project", cursor, "Claude");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        // Second comment
+        await commentService.addComment({
+            path: "project/doc.md",
+            content: "Human comment 2",
+            startLine: 3,
+            endLine: 3,
+        });
+        const raw2 = await readFile(join(testVaultPath, "project/doc.md.comments.json"), "utf-8");
+        const cf2 = JSON.parse(raw2);
+        cf2.comments[1].author = "bob";
+        await writeFile(join(testVaultPath, "project/doc.md.comments.json"), JSON.stringify(cf2));
+        const result2 = await watch2;
+        expect(result2.timedOut).toBe(false);
+        // Diff should only show the new comment
+        const newActionable = commentService.getNewActionableComments(cf2, "project/doc.md", seen1, ["Claude"]);
+        expect(newActionable).toHaveLength(1);
+        expect(newActionable[0].content).toBe("Human comment 2");
+        expect(newActionable[0].action).toBe("created");
     });
 });

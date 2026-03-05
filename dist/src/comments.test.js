@@ -495,4 +495,292 @@ describe('CommentService', () => {
             expect(result.metadata.authors).toEqual(['alice', 'test-author']);
         });
     });
+    // ============================================================================
+    // NEEDS ATTENTION
+    // ============================================================================
+    describe('needsAttention', () => {
+        const makeComment = (author, status, replies = []) => ({
+            id: 'c_test',
+            author,
+            created_at: new Date().toISOString(),
+            location: { type: 'range', start_line: 1, start_char: 0, end_line: 1, end_char: 0 },
+            content: 'Test comment',
+            status,
+            replies: replies.map(r => ({
+                id: r.id || 'r_test',
+                author: r.author || 'unknown',
+                created_at: r.created_at || new Date().toISOString(),
+                content: r.content || 'reply',
+                status: r.status || 'open',
+            })),
+            last_activity_at: new Date().toISOString(),
+            content_snippet: 'test',
+        });
+        it('returns true for open comment with no replies from human', () => {
+            const comment = makeComment('human', 'open');
+            expect(service.needsAttention(comment, ['Claude'])).toBe(true);
+        });
+        it('returns false for open comment with last reply by AI', () => {
+            const comment = makeComment('human', 'open', [
+                { author: 'Claude', content: 'AI reply' }
+            ]);
+            expect(service.needsAttention(comment, ['Claude'])).toBe(false);
+        });
+        it('returns true for open comment with human reply after AI reply', () => {
+            const comment = makeComment('human', 'open', [
+                { author: 'Claude', content: 'AI reply' },
+                { author: 'human', content: 'Human follow-up' }
+            ]);
+            expect(service.needsAttention(comment, ['Claude'])).toBe(true);
+        });
+        it('returns false for resolved comment', () => {
+            const comment = makeComment('human', 'resolved');
+            expect(service.needsAttention(comment, ['Claude'])).toBe(false);
+        });
+        it('returns true for reopened comment (resolved then human replied)', () => {
+            const comment = makeComment('human', 'open', [
+                { author: 'Claude', content: 'AI reply' },
+                { author: 'human', content: 'Actually one more thing' }
+            ]);
+            expect(service.needsAttention(comment, ['Claude'])).toBe(true);
+        });
+        it('returns false when comment author is excluded and no replies', () => {
+            const comment = makeComment('Claude', 'open');
+            expect(service.needsAttention(comment, ['Claude'])).toBe(false);
+        });
+        it('handles multiple excluded authors', () => {
+            const comment = makeComment('human', 'open', [
+                { author: 'ChatGPT', content: 'Other AI reply' }
+            ]);
+            expect(service.needsAttention(comment, ['Claude', 'ChatGPT'])).toBe(false);
+        });
+        it('matches excluded authors case-insensitively', () => {
+            const comment = makeComment('human', 'open', [
+                { author: 'claude', content: 'AI reply' }
+            ]);
+            expect(service.needsAttention(comment, ['Claude'])).toBe(false);
+        });
+    });
+    // ============================================================================
+    // GET ACTIONABLE COMMENTS
+    // ============================================================================
+    describe('getActionableComments', () => {
+        it('returns actionable comments from a folder', async () => {
+            await mkdir(join(vaultPath, 'project'), { recursive: true });
+            await writeFile(join(vaultPath, 'project', 'doc.md'), '# Doc\nLine 2\nLine 3\n');
+            // Create a sidecar with a human comment
+            const sidecar = {
+                version: 1,
+                createdBy: 'test',
+                note_path: 'project/doc.md',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                comments: [
+                    {
+                        id: 'c_human1',
+                        author: 'human',
+                        created_at: new Date().toISOString(),
+                        location: { type: 'range', start_line: 1, start_char: 0, end_line: 1, end_char: 0 },
+                        content: 'Please review this',
+                        status: 'open',
+                        replies: [],
+                        last_activity_at: new Date().toISOString(),
+                        content_snippet: '# Doc',
+                    }
+                ],
+                metadata: { total_comments: 1, open_count: 1, resolved_count: 0, authors: ['human'] },
+            };
+            await writeFile(join(vaultPath, 'project', 'doc.md.comments.json'), JSON.stringify(sidecar));
+            const result = await service.getActionableComments('project', ['Claude']);
+            expect(result).toHaveLength(1);
+            expect(result[0].id).toBe('c_human1');
+            expect(result[0].action).toBe('created');
+            expect(result[0].note).toBe('project/doc.md');
+        });
+        it('excludes comments where AI already replied', async () => {
+            await mkdir(join(vaultPath, 'project'), { recursive: true });
+            await writeFile(join(vaultPath, 'project', 'doc.md'), '# Doc\nLine 2\n');
+            const sidecar = {
+                version: 1,
+                createdBy: 'test',
+                note_path: 'project/doc.md',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                comments: [
+                    {
+                        id: 'c_replied',
+                        author: 'human',
+                        created_at: new Date().toISOString(),
+                        location: { type: 'range', start_line: 1, start_char: 0, end_line: 1, end_char: 0 },
+                        content: 'Question',
+                        status: 'open',
+                        replies: [
+                            { id: 'r_1', author: 'Claude', created_at: new Date().toISOString(), content: 'Answer', status: 'open' }
+                        ],
+                        last_activity_at: new Date().toISOString(),
+                        content_snippet: '# Doc',
+                    }
+                ],
+                metadata: { total_comments: 1, open_count: 1, resolved_count: 0, authors: ['human', 'Claude'] },
+            };
+            await writeFile(join(vaultPath, 'project', 'doc.md.comments.json'), JSON.stringify(sidecar));
+            const result = await service.getActionableComments('project', ['Claude']);
+            expect(result).toHaveLength(0);
+        });
+        it('returns empty array when no actionable comments', async () => {
+            await mkdir(join(vaultPath, 'project'), { recursive: true });
+            const result = await service.getActionableComments('project', ['Claude']);
+            expect(result).toEqual([]);
+        });
+    });
+    // ============================================================================
+    // GET NEW ACTIONABLE COMMENTS (DIFFING)
+    // ============================================================================
+    describe('getNewActionableComments', () => {
+        const now = new Date().toISOString();
+        const makeCommentFile = (comments) => ({
+            version: 1,
+            createdBy: 'test',
+            note_path: 'note.md',
+            created_at: now,
+            updated_at: now,
+            comments,
+            metadata: { total_comments: comments.length, open_count: comments.length, resolved_count: 0, authors: [] },
+        });
+        const makeTestComment = (id, author, replies = [], status = 'open') => ({
+            id,
+            author,
+            created_at: now,
+            location: { type: 'range', start_line: 1, start_char: 0, end_line: 1, end_char: 0 },
+            content: 'Test',
+            status,
+            replies: replies.map(r => ({
+                id: r.id || 'r_test',
+                author: r.author || 'unknown',
+                created_at: r.created_at || now,
+                content: r.content || 'reply',
+                status: r.status || 'open',
+            })),
+            last_activity_at: now,
+            content_snippet: 'test',
+        });
+        it('detects new comment since cursor', () => {
+            const commentFile = makeCommentFile([
+                makeTestComment('c_existing', 'human'),
+                makeTestComment('c_new', 'human'),
+            ]);
+            const seen = new Map([
+                ['c_existing', { replyCount: 0, status: 'open', lastActivityAt: now }]
+            ]);
+            const result = service.getNewActionableComments(commentFile, 'note.md', seen, ['Claude']);
+            expect(result).toHaveLength(1);
+            expect(result[0].id).toBe('c_new');
+            expect(result[0].action).toBe('created');
+        });
+        it('detects new reply from human on existing thread', () => {
+            const commentFile = makeCommentFile([
+                makeTestComment('c_1', 'human', [
+                    { author: 'Claude', content: 'AI reply' },
+                    { author: 'human', content: 'Follow-up' },
+                ]),
+            ]);
+            const seen = new Map([
+                ['c_1', { replyCount: 1, status: 'open', lastActivityAt: now }]
+            ]);
+            const result = service.getNewActionableComments(commentFile, 'note.md', seen, ['Claude']);
+            expect(result).toHaveLength(1);
+            expect(result[0].action).toBe('reply_added');
+        });
+        it('filters out new reply from AI', () => {
+            const commentFile = makeCommentFile([
+                makeTestComment('c_1', 'human', [
+                    { author: 'Claude', content: 'AI reply' },
+                ]),
+            ]);
+            const seen = new Map([
+                ['c_1', { replyCount: 0, status: 'open', lastActivityAt: now }]
+            ]);
+            const result = service.getNewActionableComments(commentFile, 'note.md', seen, ['Claude']);
+            expect(result).toHaveLength(0);
+        });
+        it('detects reopened comment', () => {
+            const commentFile = makeCommentFile([
+                makeTestComment('c_1', 'human', [
+                    { author: 'human', content: 'Reopening' },
+                ], 'open'),
+            ]);
+            const seen = new Map([
+                ['c_1', { replyCount: 0, status: 'resolved', lastActivityAt: now }]
+            ]);
+            const result = service.getNewActionableComments(commentFile, 'note.md', seen, ['Claude']);
+            expect(result).toHaveLength(1);
+            expect(result[0].action).toBe('reopened');
+        });
+        it('ignores resolved comments', () => {
+            const commentFile = makeCommentFile([
+                makeTestComment('c_1', 'human', [], 'resolved'),
+            ]);
+            const seen = new Map([
+                ['c_1', { replyCount: 0, status: 'open', lastActivityAt: now }]
+            ]);
+            const result = service.getNewActionableComments(commentFile, 'note.md', seen, ['Claude']);
+            expect(result).toHaveLength(0);
+        });
+        it('returns empty when no changes', () => {
+            const commentFile = makeCommentFile([
+                makeTestComment('c_1', 'human'),
+            ]);
+            const seen = new Map([
+                ['c_1', { replyCount: 0, status: 'open', lastActivityAt: now }]
+            ]);
+            const result = service.getNewActionableComments(commentFile, 'note.md', seen, ['Claude']);
+            expect(result).toHaveLength(0);
+        });
+    });
+    // ============================================================================
+    // BUILD SEEN COMMENTS
+    // ============================================================================
+    describe('buildSeenComments', () => {
+        it('builds seen state from comment file', () => {
+            const now = new Date().toISOString();
+            const commentFile = {
+                version: 1,
+                createdBy: 'test',
+                note_path: 'note.md',
+                created_at: now,
+                updated_at: now,
+                comments: [
+                    {
+                        id: 'c_1',
+                        author: 'human',
+                        created_at: now,
+                        location: { type: 'range', start_line: 1, start_char: 0, end_line: 1, end_char: 0 },
+                        content: 'Test',
+                        status: 'open',
+                        replies: [
+                            { id: 'r_1', author: 'Claude', created_at: now, content: 'Reply', status: 'open' },
+                        ],
+                        last_activity_at: now,
+                        content_snippet: 'test',
+                    },
+                    {
+                        id: 'c_2',
+                        author: 'human',
+                        created_at: now,
+                        location: { type: 'range', start_line: 2, start_char: 0, end_line: 2, end_char: 0 },
+                        content: 'Another',
+                        status: 'resolved',
+                        replies: [],
+                        last_activity_at: now,
+                        content_snippet: 'test',
+                    }
+                ],
+                metadata: { total_comments: 2, open_count: 1, resolved_count: 1, authors: ['human', 'Claude'] },
+            };
+            const seen = service.buildSeenComments(commentFile);
+            expect(seen.size).toBe(2);
+            expect(seen.get('c_1')).toEqual({ replyCount: 1, status: 'open', lastActivityAt: now });
+            expect(seen.get('c_2')).toEqual({ replyCount: 0, status: 'resolved', lastActivityAt: now });
+        });
+    });
 });
